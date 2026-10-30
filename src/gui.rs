@@ -9,7 +9,7 @@ use audiobook_splitter_rust::chapters::{
 };
 use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, detect_silences_between, preview_clip, split_file, split_points, user_path, AUDIO_EXTENSIONS};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, detect_silences_between, preview_clip, split_points, user_path, write_segment, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Command;
@@ -559,23 +559,20 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
         s.phase = "split";
         s.stage = "Writing files".into();
         s.done = 0;
-        s.total = plan.iter().map(|job| job.points.len()).sum();
+        s.total = plan.len();
         s.log.push(format!("Splitting into {}", output.display()));
         (plan, tracks)
     };
 
     let state = state.clone();
     thread::spawn(move || {
-        for (job, tracks) in plan.iter().zip(&tracks) {
-            let result = split_file(&job.path, &output, &job.points, Some(tracks), |_, _, out| {
-                let mut s = state.lock().unwrap();
-                s.done += 1;
-                s.log.push(format!("Writing {}", file_name(out)));
-            });
+        for (segment, track) in plan.iter().zip(&tracks) {
+            let result = write_segment(&segment.pieces, &output, track);
             let mut s = state.lock().unwrap();
+            s.done += 1;
             match result {
-                Ok(n) => s.log.push(format!("{}: wrote {} file(s)", file_name(&job.path), n)),
-                Err(e) => s.log.push(format!("{}: {}", file_name(&job.path), e)),
+                Ok(path) => s.log.push(format!("Wrote {}", file_name(&path))),
+                Err(e) => s.log.push(e),
             }
         }
         let mut s = state.lock().unwrap();

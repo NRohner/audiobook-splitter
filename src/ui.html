@@ -349,17 +349,14 @@ function loadEditor(s) {
   renderEditor();
 }
 
-// The segments the split will write, mirroring plan_from_breaks: {file, title}.
+// The tracks the split will write, mirroring plan_from_breaks: {file, title}, where `file`
+// is where the track starts. A chapter running on into the next file stays one track.
 function segments() {
   const out = [];
-  let current = null, part = 1;
   audio.forEach((_, f) => {
     const fileBreaks = draft.filter(b => b.file === f);
-    if (!(fileBreaks[0]?.at <= 0.01)) {
-      if (current) out.push({ file: f, title: `${current} (part ${++part})` });
-      else { current = 'Opening'; out.push({ file: f, title: current }); }
-    }
-    for (const b of fileBreaks) { current = b.title.trim(); part = 1; out.push({ file: f, title: current }); }
+    if (!out.length && !(fileBreaks[0]?.at <= 0.01)) out.push({ file: f, title: 'Opening' });
+    for (const b of fileBreaks) out.push({ file: f, title: b.title.trim() });
   });
   return out;
 }

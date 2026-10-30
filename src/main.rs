@@ -1,10 +1,10 @@
 mod gui;
 
 use audiobook_splitter_rust::book::{book_info, load_chapters};
-use audiobook_splitter_rust::chapters::{candidates, chapter_breaks, pick_breaks, plan_from_breaks, transcribe_candidates, AudioFile, SplitJob};
+use audiobook_splitter_rust::chapters::{candidates, chapter_breaks, pick_breaks, plan_from_breaks, transcribe_candidates, AudioFile, Segment, SplitJob};
 use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points, user_path};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, split_file, split_points, user_path, write_segment};
 use std::io::{self, Write};
 
 fn main() {
@@ -127,12 +127,16 @@ fn process_selection() {
             }
         }
 
-        let plan: Vec<SplitJob> = match &epub {
-            None => files
-                .iter()
-                .map(|f| SplitJob { path: f.path.clone(), points: split_points(&f.silences, min_silence, f.duration), names: None })
-                .filter(|job| !job.points.is_empty())
-                .collect(),
+        // Per-file splits without an EPUB, whole chapters with one; the other stays empty.
+        let plan: (Vec<SplitJob>, Vec<Segment>) = match &epub {
+            None => (
+                files
+                    .iter()
+                    .map(|f| SplitJob { path: f.path.clone(), points: split_points(&f.silences, min_silence, f.duration) })
+                    .filter(|job| !job.points.is_empty())
+                    .collect(),
+                Vec::new(),
+            ),
             Some((chapters, model, _)) => {
                 let cands = candidates(&files, min_silence);
                 println!("\nStatus: Transcribing around {} candidate breaks...", cands.len());
@@ -161,14 +165,14 @@ fn process_selection() {
                 }
                 println!("  Matched {} of {} chapters.", m.breaks.len(), chapters.len());
                 if m.breaks.is_empty() {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 } else {
-                    plan_from_breaks(&files, &chapter_breaks(&m, chapters)).expect("matched breaks are valid")
+                    (Vec::new(), plan_from_breaks(&files, &chapter_breaks(&m, chapters)).expect("matched breaks are valid"))
                 }
             }
         };
 
-        let total_segments: usize = plan.iter().map(|job| job.points.len()).sum();
+        let total_segments: usize = plan.0.iter().map(|job| job.points.len()).sum::<usize>() + plan.1.len();
         if total_segments == 0 {
             println!("\nNo silences detected longer than the specified threshold across all files with current settings.");
             if prompt("Do you want to re-analyze with different settings? (y/n): ").eq_ignore_ascii_case("y") {
@@ -178,7 +182,7 @@ fn process_selection() {
             return;
         }
 
-        println!("\nSummary: Identified {} total audio segments across {} of {} file(s).", total_segments, plan.len(), input_paths.len());
+        println!("\nSummary: Identified {} total audio segments across {} of {} file(s).", total_segments, files.len(), input_paths.len());
         match prompt("Do you want to (r)e-analyze with different settings or (p)roceed to split all files? (r/p): ").to_lowercase().as_str() {
             "p" => break plan,
             "r" => continue,
@@ -186,19 +190,26 @@ fn process_selection() {
         }
     };
 
-    // With an EPUB every part is a numbered, tagged track of the book.
-    let tracks = match &epub {
-        Some((_, _, meta)) => Some(tracks(&plan, meta).expect("default template is valid")),
-        None => None,
-    };
-    for (i, SplitJob { path, points, .. }) in plan.iter().enumerate() {
+    let (jobs, segments) = plan;
+    for SplitJob { path, points } in &jobs {
         println!("\n--- Splitting: {} ---", path.display());
-        let result = split_file(path, &output_dir, points, tracks.as_ref().map(|t| &t[i][..]), |part, total, out| {
+        let result = split_file(path, &output_dir, points, |part, total, out| {
             println!("  Status: Writing part {}/{} to '{}'...", part, total, out.display());
         });
         match result {
             Ok(n) => println!("Successfully wrote {} file(s) for {}.", n, path.display()),
             Err(e) => eprintln!("An error occurred during splitting {}: {}", path.display(), e),
+        }
+    }
+
+    // With an EPUB every chapter is a numbered, tagged track of the book.
+    if let Some((_, _, meta)) = &epub {
+        let tracks = tracks(&segments, meta).expect("default template is valid");
+        for (i, (segment, track)) in segments.iter().zip(&tracks).enumerate() {
+            println!("  Status: Writing chapter {}/{} to '{}'...", i + 1, segments.len(), track.name);
+            if let Err(e) = write_segment(&segment.pieces, &output_dir, track) {
+                eprintln!("An error occurred: {}", e);
+            }
         }
     }
 }

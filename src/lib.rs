@@ -6,6 +6,7 @@ pub mod meta;
 pub mod transcribe;
 use regex::Regex;
 use std::path::{Path, PathBuf};
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4b", "wav", "flac", "aac", "m4a", "ogg"];
@@ -185,19 +186,16 @@ pub fn preview_clip(input: &Path, start: f64, seconds: f64) -> Result<Vec<u8>, S
 }
 
 // Writes one `<stem>_NNN.<ext>` file per segment into `out_dir`.
-// With `tracks`, segment i is named and tagged by `tracks[i]` (never overwriting an existing file).
 // `on_part(part, total, path)` is called before each part is written. Returns the number of files written.
 pub fn split_file(
     input: &Path,
     out_dir: &Path,
     points: &[f64],
-    tracks: Option<&[meta::Track]>,
     mut on_part: impl FnMut(usize, usize, &Path),
 ) -> Result<usize, String> {
     let ext = input.extension().unwrap_or_default().to_string_lossy().to_string();
     let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("audio_part");
     let mut index = next_file_index(out_dir, stem, &ext)?;
-    let no_video = ["m4b", "m4a"].contains(&ext.to_lowercase().as_str());
     let mut start = 0.0;
     let mut written = 0;
 
@@ -207,45 +205,103 @@ pub fn split_file(
             start = end;
             continue;
         }
-        let track = tracks.and_then(|t| t.get(i));
-        let out_path = match track {
-            Some(track) => unique_path(out_dir, &track.name, &ext),
-            None => out_dir.join(format!("{}_{:03}.{}", stem, index, ext)),
-        };
+        let out_path = out_dir.join(format!("{}_{:03}.{}", stem, index, ext));
         on_part(i + 1, points.len(), &out_path);
-
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
-            .arg(input)
-            .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy"]);
-        // ponytail: drops cover art from M4B/M4A parts; the ipod muxer rejects cover
-        // tracks stored as MJPEG video. Re-attach covers with a remux if anyone misses them.
-        if no_video {
-            cmd.arg("-vn");
-        }
-        for (key, value) in track.map_or(&[][..], |t| &t.tags) {
-            cmd.arg("-metadata").arg(format!("{}={}", key, value));
-        }
-        let output = cmd
-            .arg("-y")
-            .arg(&out_path)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("Failed to run ffmpeg for splitting: {}", e))?;
-        if !output.status.success() {
-            let _ = std::fs::remove_file(&out_path); // Don't leave a broken part behind.
-            return Err(format!(
-                "FFmpeg failed on part {}:\n{}",
-                i + 1,
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
+        cut(input, start, duration, &[], &out_path)
+            .map_err(|e| format!("FFmpeg failed on part {}:\n{}", i + 1, e))?;
 
         start = end;
         index += 1;
         written += 1;
     }
     Ok(written)
+}
+
+// Writes one chapter, joined from `pieces` with stream copy, to `<out_dir>/<track.name>.<ext>`
+// (never overwriting an existing file) and tags it. The pieces must share a codec.
+pub fn write_segment(pieces: &[chapters::Piece], out_dir: &Path, track: &meta::Track) -> Result<PathBuf, String> {
+    let first = pieces.first().ok_or("A chapter has no audio.")?;
+    let ext = first.path.extension().unwrap_or_default().to_string_lossy().to_string();
+    let out_path = unique_path(out_dir, &track.name, &ext);
+    let result = match pieces {
+        [p] => cut(&p.path, p.start, p.end - p.start, &track.tags, &out_path),
+        _ => join(pieces, &track.tags, &out_path, &ext),
+    };
+    result.map(|_| out_path).map_err(|e| format!("FFmpeg failed on '{}':\n{}", track.name, e))
+}
+
+// Cuts each piece to a temporary file beside `out`, then joins them in order. (The concat
+// demuxer's own `inpoint` seeks on an M4B's cover track, so it would start from 0.)
+fn join(pieces: &[chapters::Piece], tags: &[(String, String)], out: &Path, ext: &str) -> Result<(), String> {
+    let parts: Vec<PathBuf> = (0..pieces.len()).map(|i| out.with_extension(format!("part{}.{}", i, ext))).collect();
+    let result = pieces
+        .iter()
+        .zip(&parts)
+        .try_for_each(|(p, part)| cut(&p.path, p.start, p.end - p.start, &[], part))
+        .and_then(|_| concat(&parts, &pieces[0].path, tags, out));
+    for part in &parts {
+        let _ = std::fs::remove_file(part);
+    }
+    result
+}
+
+// Cuts `duration` seconds of `input` from `start` into `out` with stream copy and tags it.
+// Returns FFmpeg's error output on failure.
+fn cut(input: &Path, start: f64, duration: f64, tags: &[(String, String)], out: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input)
+        .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy"]);
+    // ponytail: drops cover art from M4B/M4A parts; the ipod muxer rejects cover
+    // tracks stored as MJPEG video. Re-attach covers with a remux if anyone misses them.
+    let ext = input.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+    if ["m4b", "m4a"].contains(&ext.as_str()) {
+        cmd.arg("-vn");
+    }
+    for (key, value) in tags {
+        cmd.arg("-metadata").arg(format!("{}={}", key, value));
+    }
+    finish(cmd.arg("-y").arg(out).stdin(Stdio::null()).output(), out)
+}
+
+// Joins `parts` into `out` with stream copy, keeping `source`'s tags and adding `tags`.
+fn concat(parts: &[PathBuf], source: &Path, tags: &[(String, String)], out: &Path) -> Result<(), String> {
+    // A concat demuxer list on stdin, with `file:` paths so they don't resolve against `pipe:`;
+    // inside quotes only ' needs escaping, as '\''.
+    let list: String = parts
+        .iter()
+        .map(|p| {
+            let path = std::path::absolute(p).unwrap_or_else(|_| p.clone());
+            format!("file 'file:{}'\n", path.to_string_lossy().replace('\'', r"'\''"))
+        })
+        .collect();
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe", "-i", "pipe:0", "-i"])
+        .arg(source)
+        .args(["-map", "0:a", "-map_metadata", "1", "-c", "copy"]);
+    for (key, value) in tags {
+        cmd.arg("-metadata").arg(format!("{}={}", key, value));
+    }
+    let mut child = cmd
+        .arg("-y")
+        .arg(out)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let _ = child.stdin.take().unwrap().write_all(list.as_bytes()); // Dropping it ends the list.
+    finish(child.wait_with_output(), out)
+}
+
+// FFmpeg's error output if it failed, removing `out` so no broken file is left behind.
+fn finish(output: std::io::Result<std::process::Output>, out: &Path) -> Result<(), String> {
+    let output = output.map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(out);
+    Err(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
 // `<dir>/<name>.<ext>`, or `<name> (2).<ext>` etc. if that already exists.
@@ -269,6 +325,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn duration(path: &Path) -> f64 {
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap()
     }
 
     fn s(start: f64, duration: f64) -> Silence {
@@ -371,11 +436,20 @@ size=N/A time=00:00:10.00
             "-c:v", "copy", "-f", "mp4", "book.m4b"]);
         let out = dir.join("out");
         fs::create_dir(&out).unwrap();
-        assert_eq!(split_file(&dir.join("book.m4b"), &out, &[3.0, 6.0], None, |_, _, _| {}), Ok(2));
+        assert_eq!(split_file(&dir.join("book.m4b"), &out, &[3.0, 6.0], |_, _, _| {}), Ok(2));
+
+        // Joined from two files; the cover track mustn't drag the cut back to the start.
+        let pieces = [
+            chapters::Piece { path: dir.join("book.m4b"), start: 4.0, end: 6.0 },
+            chapters::Piece { path: dir.join("book.m4b"), start: 0.0, end: 1.0 },
+        ];
+        let track = meta::Track { name: "joined".into(), tags: vec![] };
+        let joined = write_segment(&pieces, &out, &track).unwrap();
+        assert!((duration(&joined) - 3.0).abs() < 0.2, "{}", duration(&joined));
     }
 
     #[test]
-    fn split_file_writes_track_names_and_tags() {
+    fn write_segment_names_and_tags_a_single_piece() {
         let dir = temp_dir("tags");
         let mp3 = dir.join("book.mp3");
         let made = Command::new("ffmpeg")
@@ -390,8 +464,9 @@ size=N/A time=00:00:10.00
         };
         let out = dir.join("out");
         fs::create_dir(&out).unwrap();
-        let tracks = [track("00 - Opening", 1), track("01 - One", 2)];
-        assert_eq!(split_file(&mp3, &out, &[2.0, 4.0], Some(&tracks), |_, _, _| {}), Ok(2));
+        let one = chapters::Piece { path: mp3.clone(), start: 2.0, end: 4.0 };
+        assert_eq!(write_segment(&[one], &out, &track("01 - One", 2)), Ok(out.join("01 - One.mp3")));
+        assert!((duration(&out.join("01 - One.mp3")) - 2.0).abs() < 0.2);
 
         let probe = Command::new("ffprobe")
             .args(["-v", "error", "-show_entries", "format_tags=title,track,disc,genre", "-of", "default=noprint_wrappers=1"])
@@ -402,6 +477,38 @@ size=N/A time=00:00:10.00
         for want in ["title=01 - one", "track=2/2", "disc=1/1", "genre=source"] {
             assert!(tags.contains(want), "missing {} in {}", want, tags);
         }
+    }
+
+    #[test]
+    fn write_segment_joins_pieces_of_several_files() {
+        let dir = temp_dir("join");
+        for (name, seconds) in [("a.mp3", "6"), ("b's.mp3", "4")] {
+            let made = Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", &format!("sine=d={}", seconds), "-metadata", "genre=Source", "-y"])
+                .arg(dir.join(name))
+                .status()
+                .unwrap();
+            assert!(made.success());
+        }
+        let out = dir.join("out");
+        fs::create_dir(&out).unwrap();
+        let pieces = [
+            chapters::Piece { path: dir.join("a.mp3"), start: 2.0, end: 6.0 },
+            chapters::Piece { path: dir.join("b's.mp3"), start: 0.0, end: 3.0 },
+        ];
+        let track = meta::Track { name: "01 - One".into(), tags: vec![("title".into(), "01 - One".into())] };
+        let path = write_segment(&pieces, &out, &track).unwrap();
+        assert_eq!(path, out.join("01 - One.mp3"));
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format_tags=title,genre", "-of", "default=noprint_wrappers=1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&probe.stdout).to_lowercase();
+        assert!((duration(&path) - 7.0).abs() < 0.2, "{}", duration(&path));
+        assert!(info.contains("title=01 - one") && info.contains("genre=source"), "{}", info);
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1, "no list file left behind");
     }
 
     #[test]
