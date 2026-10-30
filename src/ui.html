@@ -29,7 +29,11 @@
   .row { display: flex; gap: 8px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 16px; }
   .opt { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 4px; }
-  .missing { color: var(--err); font-size: 13px; margin: 12px 0 0; }
+  .missing { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .missing .editor-bar { margin-bottom: 4px; }
+  .missing h3 { font-size: 14px; margin: 0; color: var(--err); margin-right: auto; }
+  .missing td { padding: 5px 4px; vertical-align: middle; }
+  .missing .tried { color: var(--muted); font-size: 13px; margin-left: 8px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   details p { margin: 6px 0 0; font-size: 13px; }
   details b { font-weight: 600; color: var(--muted); }
@@ -159,7 +163,14 @@
       <thead><tr><th><span class="opt" style="margin:0">Listen</span></th><th>Chapter</th><th></th></tr></thead>
       <tbody id="break-rows"></tbody>
     </table>
-    <p id="missing" class="missing" hidden></p>
+    <div id="missing" class="missing" hidden>
+      <div class="editor-bar">
+        <h3 id="missing-title">Missing chapters</h3>
+        <button id="rescan-all" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>Re-scan all</button>
+      </div>
+      <div class="hint" style="margin:0 0 6px">A re-scan listens again between the chapters found either side, with a shorter minimum silence and a higher noise threshold. Front matter is usually not narrated.</div>
+      <table><tbody id="missing-rows"></tbody></table>
+    </div>
     <div class="add-row">
       <label for="add-time" style="margin:0">Add a chapter at</label>
       <select id="add-file" aria-label="Audio file"></select>
@@ -266,6 +277,7 @@ const STOP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="current
 const UP_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 const DOWN_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>';
 const TRASH_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>';
+const RESCAN_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>';
 const PLUS_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
 function setPlaying(k) {
   playing = k;
@@ -317,6 +329,7 @@ function transcriptLine(label, text) {
 // Chapter editor. `draft` is [{file, at, title, score}] sorted by position; its first
 // entry is always the start of the book. `original` is what the analysis suggested.
 let run = null, original = [], draft = [], silences = [], audio = [];
+let merged = 0; // How many of the status's breaks the editor has taken in.
 const key = b => b.file + ':' + b.at.toFixed(3);
 const order = (a, b) => a.file - b.file || a.at - b.at;
 const where = b => (audio.length > 1 ? audio[b.file].name + ' at ' : '') + clock(b.at);
@@ -326,6 +339,7 @@ function loadEditor(s) {
   run = s.run;
   original = s.breaks.map(b => ({ ...b }));
   draft = s.breaks.map(b => ({ ...b }));
+  merged = s.breaks.length;
   silences = s.silences;
   audio = s.audio;
   for (const f of metaFields) $('m_' + f).value = s.meta[f];
@@ -458,6 +472,41 @@ function updatePreview() {
   if (segs.length > 3) preview.append(`, ... (${segs.length} tracks)`);
 }
 
+// Breaks a re-scan found join the suggestions without touching the user's edits.
+function mergeRescans(s) {
+  const added = s.breaks.slice(merged).filter(b => !draft.some(d => key(d) === key(b)));
+  merged = s.breaks.length;
+  silences = s.silences;
+  original = [...original, ...added.map(b => ({ ...b }))].sort(order);
+  draft = [...draft, ...added.map(b => ({ ...b }))].sort(order);
+  renderEditor();
+}
+
+async function rescan(chapters) {
+  showError();
+  try { await api('/rescan', { chapters }); poll(); } catch (e) { showError(e); }
+}
+$('rescan-all').addEventListener('click', () => rescan(lastStatus.missing.map(m => m.chapter)));
+
+function renderMissing(s) {
+  $('missing').hidden = !s.missing.length;
+  $('missing-title').textContent = `Missing chapters (${s.missing.length})`;
+  $('rescan-all').disabled = s.running;
+  $('missing-rows').replaceChildren(...s.missing.map(m => {
+    const tr = document.createElement('tr');
+    const name = document.createElement('td'); name.className = 'chapter-name'; name.textContent = m.title;
+    if (m.tried) { const t = document.createElement('span'); t.className = 'tried'; t.textContent = 'not found by re-scan'; name.append(t); }
+    const actions = document.createElement('td'); actions.className = 'row-actions';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.innerHTML = RESCAN_ICON + 'Re-scan'; btn.disabled = s.running;
+    btn.setAttribute('aria-label', `Re-scan for ${m.title}`);
+    btn.addEventListener('click', () => rescan([m.chapter]));
+    actions.append(btn);
+    tr.append(name, actions);
+    return tr;
+  }));
+}
+
 $('discard').addEventListener('click', () => { draft = original.map(b => ({ ...b })); renderEditor(); });
 
 // "1:02:03", "2:03" or plain seconds.
@@ -477,6 +526,7 @@ function render(s) {
   if (!s) return;
   if (!s.running && s.audio.length && s.run !== run) loadEditor(s);
   const editing = run !== null && run === s.run;
+  if (editing && (s.breaks.length > merged || s.silences.length !== silences.length)) mergeRescans(s);
   const segs = editing ? segments() : [];
   $('analyze').disabled = s.running;
   $('split').disabled = s.running || !editing || analyzedKey !== settingsKey() || !$('output').value.trim();
@@ -492,8 +542,7 @@ function render(s) {
        + (analyzedKey !== settingsKey() ? ' Settings changed, analyze again to split.' : ''));
 
   if (!editing && playing !== null) { player.pause(); playing = null; }
-  $('missing').hidden = !s.missing.length;
-  $('missing').textContent = `No break found for: ${s.missing.join(', ')}. Front matter is usually not narrated; for real chapters try a shorter minimum silence or a lower match threshold, or add them from the silences below.`;
+  renderMissing(s);
 
   $('rows').replaceChildren(...s.files.map(f => {
     const tr = document.createElement('tr');

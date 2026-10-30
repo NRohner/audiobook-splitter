@@ -4,11 +4,12 @@
 // analysis and splitting run on a background thread and the page polls /status.
 use audiobook_splitter_rust::book::{book_info, load_chapters};
 use audiobook_splitter_rust::chapters::{
-    candidates, chapter_breaks, pick_breaks, plan_from_breaks, silence_breaks, transcribe_candidates, AudioFile, Break,
+    candidates, chapter_breaks, pick_breaks, plan_from_breaks, rescan_chapter, rescan_window, silence_breaks,
+    transcribe_candidates, window_candidates, window_ranges, AudioFile, Break, Candidate, ChapterBreak,
 };
 use audiobook_splitter_rust::meta::{tracks, Metadata, DEFAULT_TEMPLATE};
 use audiobook_splitter_rust::transcribe::{find_model, Transcriber};
-use audiobook_splitter_rust::{collect_inputs, detect_silences, preview_clip, split_file, split_points, user_path, AUDIO_EXTENSIONS};
+use audiobook_splitter_rust::{collect_inputs, detect_silences, detect_silences_between, preview_clip, split_file, split_points, user_path, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::Command;
@@ -19,6 +20,9 @@ use tiny_http::{Header, Method, Request, Response, Server};
 const PAGE: &str = include_str!("ui.html");
 const DEFAULT_PORT: u16 = 7878;
 const CLIP_SECONDS: f64 = 30.0;
+// ponytail: fixed loosening for re-scans; make them settings if one step isn't enough.
+const RESCAN_SILENCE_FACTOR: f64 = 0.5;
+const RESCAN_NOISE_DB: f64 = 10.0;
 
 #[derive(Serialize, Clone)]
 struct FileRow {
@@ -44,6 +48,23 @@ struct SilenceRow {
     after: String,
 }
 
+// An EPUB chapter with no break; `tried` once a re-scan also came up empty.
+#[derive(Serialize)]
+struct MissingRow {
+    chapter: usize,
+    title: String,
+    tried: bool,
+}
+
+// What an EPUB analysis used, kept so missing chapters can be re-scanned.
+struct EpubRun {
+    chapters: Vec<audiobook_splitter_rust::book::Chapter>,
+    model: std::path::PathBuf,
+    min_silence: f64,
+    noise_db: f64,
+    threshold: f64,
+}
+
 #[derive(Serialize)]
 struct AudioRow {
     name: String,
@@ -62,11 +83,15 @@ struct Status {
     audio: Vec<AudioRow>, // The analyzed files; `file` in breaks and silences indexes these.
     breaks: Vec<BreakRow>,
     silences: Vec<SilenceRow>,
-    missing: Vec<String>, // EPUB chapters with no matching break.
+    missing: Vec<MissingRow>, // EPUB chapters with no matching break.
     meta: Metadata,       // Suggested tags.
     log: Vec<String>,
     #[serde(skip)]
     analyzed: Vec<AudioFile>, // Same order as `audio`.
+    #[serde(skip)]
+    epub: Option<Arc<EpubRun>>,
+    #[serde(skip)]
+    found: Vec<ChapterBreak>, // Matched chapters, including re-scan finds.
 }
 
 type Shared = Arc<Mutex<Status>>;
@@ -91,6 +116,11 @@ struct SplitReq {
     output: String,
     breaks: Vec<Break>,
     meta: Metadata,
+}
+
+#[derive(Deserialize)]
+struct RescanReq {
+    chapters: Vec<usize>,
 }
 
 #[derive(Deserialize)]
@@ -160,6 +190,7 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
         },
         (Method::Post, "/browse") => parse(&body).and_then(browse),
         (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state)),
+        (Method::Post, "/rescan") => parse(&body).and_then(|r| start_rescan(r, state)),
         (Method::Post, "/split") => parse(&body).and_then(|r| start_split(r, state)),
         _ => {
             let _ = req.respond(Response::from_string("Not found").with_status_code(404));
@@ -341,6 +372,9 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
                 s.silences = silences;
                 s.audio = files.iter().map(|f| AudioRow { name: file_name(&f.path), duration: f.duration }).collect();
                 s.analyzed = files;
+                s.epub = epub.map(|(chapters, model)| {
+                    Arc::new(EpubRun { chapters, model, min_silence: req.min_silence, noise_db: req.noise_db, threshold: req.threshold })
+                });
                 s.log.push("Analysis complete.".into());
             }
             Err(e) => s.log.push(format!("Error: {}", e)),
@@ -380,21 +414,124 @@ fn match_with_epub(
             BreakRow { file: b.file, at: b.at, title: b.title, score }
         })
         .collect();
-    let silences = cands
+    let silences = silence_rows(&cands, &transcripts);
+
+    let mut s = state.lock().unwrap();
+    s.missing = m.missing.iter().map(|&ch| MissingRow { chapter: ch, title: chapter_title(chapters, ch), tried: false }).collect();
+    s.log.push(format!("Matched {} of {} chapters.", m.breaks.len(), chapters.len()));
+    s.found = m.breaks;
+    Ok((breaks, silences))
+}
+
+fn silence_rows(cands: &[Candidate], transcripts: &[(String, String)]) -> Vec<SilenceRow> {
+    cands
         .iter()
-        .zip(&transcripts)
+        .zip(transcripts)
         .map(|(c, (before, after))| SilenceRow {
             file: c.file,
             at: c.split_at(),
             before: before.trim().to_string(),
             after: after.trim().to_string(),
         })
-        .collect();
+        .collect()
+}
+
+fn chapter_title(chapters: &[audiobook_splitter_rust::book::Chapter], ch: usize) -> String {
+    chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1))
+}
+
+// Looks again for missing chapters, in book order, between the chapters found either
+// side of each, with a shorter minimum silence and a higher noise threshold.
+fn start_rescan(req: RescanReq, state: &Shared) -> Result<Value, String> {
+    let (epub, files, mut chapters) = {
+        let mut s = state.lock().unwrap();
+        if s.running {
+            return Err("A job is already running.".into());
+        }
+        let epub = s.epub.clone().ok_or("Analyze with an EPUB first.")?;
+        let mut chapters = req.chapters;
+        chapters.retain(|ch| s.missing.iter().any(|m| m.chapter == *ch));
+        if chapters.is_empty() {
+            return Err("Those chapters aren't missing any more.".into());
+        }
+        let files: Vec<AudioFile> =
+            s.analyzed.iter().map(|f| AudioFile { path: f.path.clone(), silences: vec![], duration: f.duration }).collect();
+        s.running = true;
+        s.phase = "analyze";
+        (epub, files, chapters)
+    };
+    chapters.sort();
+    chapters.dedup();
+
+    let state = state.clone();
+    thread::spawn(move || {
+        let result = Transcriber::load(&epub.model).and_then(|transcriber| {
+            for ch in chapters {
+                rescan_one(ch, &epub, &files, &transcriber, &state)?;
+            }
+            Ok(())
+        });
+        let mut s = state.lock().unwrap();
+        if let Err(e) = result {
+            s.log.push(format!("Error: {}", e));
+        }
+        s.running = false;
+    });
+    Ok(json!({}))
+}
+
+fn rescan_one(ch: usize, epub: &EpubRun, files: &[AudioFile], transcriber: &Transcriber, state: &Shared) -> Result<(), String> {
+    let title = chapter_title(&epub.chapters, ch);
+    let min_silence = epub.min_silence * RESCAN_SILENCE_FACTOR;
+    let noise_db = epub.noise_db + RESCAN_NOISE_DB;
+    let (from, to) = rescan_window(&state.lock().unwrap().found, ch, files);
+    let ranges = window_ranges(files, from, to);
+    {
+        let mut s = state.lock().unwrap();
+        s.stage = format!("Re-scanning '{}': detecting silences", title);
+        s.done = 0;
+        s.total = ranges.len();
+        s.log.push(format!("Re-scanning '{}' (min silence {}s, noise {}dB)", title, min_silence, noise_db));
+    }
+
+    let mut scan: Vec<AudioFile> =
+        files.iter().map(|f| AudioFile { path: f.path.clone(), silences: vec![], duration: f.duration }).collect();
+    for (i, &(f, start, end)) in ranges.iter().enumerate() {
+        scan[f].silences = detect_silences_between(&files[f].path, start, end, min_silence, noise_db)?;
+        state.lock().unwrap().done = i + 1;
+    }
+    let cands = window_candidates(&scan, from, to, min_silence);
+    {
+        let mut s = state.lock().unwrap();
+        s.stage = format!("Re-scanning '{}': transcribing", title);
+        s.done = 0;
+        s.total = cands.len();
+    }
+    let transcripts = transcribe_candidates(&scan, &cands, transcriber, |done, _| state.lock().unwrap().done = done)?;
+    let found = rescan_chapter(&cands, &transcripts, &epub.chapters, ch, epub.threshold);
 
     let mut s = state.lock().unwrap();
-    s.missing = m.missing.iter().map(|&ch| chapters[ch].title.clone().unwrap_or_else(|| format!("Section {}", ch + 1))).collect();
-    s.log.push(format!("Matched {} of {} chapters.", m.breaks.len(), chapters.len()));
-    Ok((breaks, silences))
+    for row in silence_rows(&cands, &transcripts) {
+        if !s.silences.iter().any(|x| x.file == row.file && (x.at - row.at).abs() < 0.001) {
+            s.silences.push(row);
+        }
+    }
+    s.silences.sort_by(|a, b| (a.file, a.at).partial_cmp(&(b.file, b.at)).unwrap());
+    match found {
+        Some(b) => {
+            s.log.push(format!("Found '{}' (score {:.2}).", title, b.score));
+            s.breaks.push(BreakRow { file: b.file, at: b.at, title, score: Some(b.score) });
+            s.missing.retain(|m| m.chapter != ch);
+            s.found.push(b);
+        }
+        None => {
+            s.log.push(format!("'{}': no match among {} silences.", title, cands.len()));
+            if let Some(m) = s.missing.iter_mut().find(|m| m.chapter == ch) {
+                m.tried = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {

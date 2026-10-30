@@ -120,21 +120,7 @@ pub fn detect_silences(
     min_silence: f64,
     noise_db: f64,
 ) -> Result<(Vec<Silence>, f64), String> {
-    let output = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-i")
-        .arg(input)
-        .arg("-af")
-        .arg(format!("silencedetect=n={}dB:d={}", noise_db, min_silence))
-        .args(["-f", "null", "-"])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to run ffmpeg. Is FFmpeg installed and on your PATH? ({})", e))?;
-    let log = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(format!("FFmpeg silence detection failed:\n{}", log));
-    }
-
+    let silences = silencedetect(input, &[], min_silence, noise_db)?;
     let probe = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
         .arg(input)
@@ -149,7 +135,38 @@ pub fn detect_silences(
         .parse::<f64>()
         .map_err(|e| format!("Failed to parse audio duration: {}", e))?;
 
-    Ok((parse_silencedetect(&log), total_duration))
+    Ok((silences, total_duration))
+}
+
+// Silences between `from` and `to` seconds of `input`, in times from the file's start.
+pub fn detect_silences_between(input: &Path, from: f64, to: f64, min_silence: f64, noise_db: f64) -> Result<Vec<Silence>, String> {
+    let range = ["-ss".to_string(), from.to_string(), "-t".to_string(), (to - from).to_string()];
+    let mut silences = silencedetect(input, &range, min_silence, noise_db)?;
+    for s in &mut silences {
+        s.start += from;
+        s.end += from;
+    }
+    Ok(silences)
+}
+
+// Runs FFmpeg `silencedetect`; `input_args` go before `-i` (e.g. a seek).
+fn silencedetect(input: &Path, input_args: &[String], min_silence: f64, noise_db: f64) -> Result<Vec<Silence>, String> {
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .args(input_args)
+        .arg("-i")
+        .arg(input)
+        .arg("-af")
+        .arg(format!("silencedetect=n={}dB:d={}", noise_db, min_silence))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg. Is FFmpeg installed and on your PATH? ({})", e))?;
+    let log = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!("FFmpeg silence detection failed:\n{}", log));
+    }
+    Ok(parse_silencedetect(&log))
 }
 
 // Decodes `seconds` of `input` from `start` into MP3 bytes, playable in any browser.
@@ -308,6 +325,21 @@ size=N/A time=00:00:10.00
     fn split_points_no_duplicate_end() {
         // Silence midpoint lands on the end of the file.
         assert_eq!(split_points(&[s(58.0, 4.0)], 2.0, 60.0), vec![60.0]);
+    }
+
+    #[test]
+    fn detect_silences_between_reports_file_times() {
+        let dir = temp_dir("between");
+        let wav = dir.join("gap.wav");
+        let made = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "aevalsrc=if(between(t\\,4\\,6)\\,0\\,sin(2*PI*440*t)):d=10", "-y"])
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let found = detect_silences_between(&wav, 2.0, 9.0, 1.0, -40.0).unwrap();
+        assert_eq!(found.len(), 1, "{:?}", found);
+        assert!((found[0].start - 4.0).abs() < 0.1 && (found[0].end - 6.0).abs() < 0.1, "{:?}", found);
     }
 
     #[test]
