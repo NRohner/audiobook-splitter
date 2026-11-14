@@ -73,7 +73,7 @@ pub struct Detect {
     /// Minimum EPUB match score, 0 to 1
     #[arg(long, default_value_t = 0.4)]
     pub threshold: f64,
-    /// Don't read or write the transcript cache for this run
+    /// Don't read or write the cache (silences and transcripts) for this run
     #[arg(long)]
     pub no_cache: bool,
 }

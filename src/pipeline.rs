@@ -217,7 +217,7 @@ fn match_with_epub(
 ) -> Result<Findings, String> {
     let cands = candidates(files, settings.min_silence);
     emit(Event::Stage { name: "Transcribing around silences".into(), total: cands.len() });
-    emit(Event::Log(format!("Transcribing {} candidate breaks with Whisper...", cands.len())));
+    emit(Event::Log(format!("Matching {} candidate breaks to the book...", cands.len())));
     let mut transcriber = LazyTranscriber::new(&epub.model);
     let transcripts = transcribe_cached(
         files,

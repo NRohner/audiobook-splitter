@@ -93,11 +93,13 @@ impl Transcriber {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        // Changing these parameters can change transcripts: bump cache::TRANSCRIBE_VERSION.
         state.full(params, samples).map_err(|e| format!("Whisper failed: {}", e))?;
         Ok(state.as_iter().map(|seg| seg.to_string()).collect::<Vec<_>>().join(" "))
     }
 }
 
+// The decode/resample chain here affects transcripts: bump cache::TRANSCRIBE_VERSION when it changes.
 // Decodes `duration` seconds of `input` starting at `start` into 16 kHz mono f32 samples.
 pub fn clip_samples(input: &Path, start: f64, duration: f64) -> Result<Vec<f32>, String> {
     let output = Command::new("ffmpeg")

@@ -155,7 +155,7 @@ The CLI does everything the GUI does, step by step, joined by a plan file. It wo
 | `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
 | `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, ...) |
 | `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
-| `cache info` / `cache clear [path]` | Show or empty the cache of silences and transcripts (see below) |
+| `cache info` / `cache clear [path ...]` | Show or empty the cache of silences and transcripts (see below) |
 | `gui` | Start the web GUI |
 
 A typical remote session:
@@ -179,7 +179,7 @@ audiobook-splitter-rust cache clear ~/books/mybook  # delete just this book's en
 audiobook-splitter-rust analyze book/ --no-cache    # ignore the cache for one run
 ```
 
-The folder is `~/Library/Caches/audiobook-splitter` (macOS), `$XDG_CACHE_HOME` or `~/.cache/audiobook-splitter` (Linux) or `%LOCALAPPDATA%\audiobook-splitter\cache` (Windows); set `AUDIOBOOK_CACHE_DIR` to put it elsewhere. Entries never expire: a changed audio file or a different model simply doesn't match, so `cache clear` is only for reclaiming space.
+The folder is `~/Library/Caches/audiobook-splitter` (macOS), `$XDG_CACHE_HOME/audiobook-splitter` (default `~/.cache/audiobook-splitter`) (Linux) or `%LOCALAPPDATA%\audiobook-splitter\cache` (Windows); set `AUDIOBOOK_CACHE_DIR` to put it elsewhere. Entries never expire: a changed audio file or a different model simply doesn't match, so `cache clear` is only for reclaiming space. rescan's narrower silence passes are not cached, only their transcriptions.
 
 ## Troubleshooting and Tips
 

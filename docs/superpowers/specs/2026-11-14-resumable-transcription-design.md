@@ -65,7 +65,8 @@ One JSON file per audio file: `<fingerprint>.json` where the fingerprint is the 
 
 ## Errors and edge cases
 
-- The cache must never change results: a hit returns exactly what a miss would have computed (same settings, same model, same clip length). A changed audio file (size or modified time) changes the fingerprint and misses.
+- The cache must never change results: a hit returns what a miss would have computed (same settings, same model, same clip length), with positions matched to the millisecond. A changed audio file (size or modified time) changes the fingerprint and misses.
+- `TRANSCRIBE_VERSION` in src/cache.rs must be bumped when transcription parameters or clip decoding change; cached transcripts then miss, silences are kept.
 - Model swap: different model name or size misses; both sets of transcripts coexist in the file.
 - Corrupt or unwritable cache: ignored, with at most one log line per run.
 - Ctrl-C mid-chunk loses that chunk only; the next run resumes from the last stored chunk.

@@ -11,12 +11,16 @@ use std::time::UNIX_EPOCH;
 
 const CACHE_VERSION: u32 = 1;
 
+// Bump when a change to Whisper's parameters, the clip decoding in transcribe.rs, or the
+// whisper-rs version could change transcripts; cached transcripts then stop matching, silences are kept.
+pub const TRANSCRIBE_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize)]
 struct Entry {
     version: u32,
     // "<min_silence>|<noise_db>" -> the file's silences
     silences: BTreeMap<String, SilenceSet>,
-    // "<model name>|<model bytes>|clip<seconds>" -> "<start_ms>|<end_ms>" -> (before, after)
+    // "<model name>|<model bytes>|clip<seconds>|t<TRANSCRIBE_VERSION>" -> "<start_ms>|<end_ms>" -> (before, after)
     transcripts: BTreeMap<String, BTreeMap<String, (String, String)>>,
 }
 
@@ -52,8 +56,8 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 // None when the file can't be read (so there is nothing to key on).
 fn fingerprint(audio: &Path) -> Option<String> {
     let meta = std::fs::metadata(audio).ok()?;
-    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let abs = std::path::absolute(audio).ok()?;
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    let abs = std::fs::canonicalize(audio).or_else(|_| std::path::absolute(audio)).ok()?;
     let id = format!("{}|{}|{}", abs.display(), meta.len(), modified);
     Some(format!("{:016x}", fnv1a(id.as_bytes())))
 }
@@ -65,7 +69,7 @@ fn settings_key(min_silence: f64, noise_db: f64) -> String {
 
 fn model_key(model: &Path) -> String {
     let name = model.file_name().unwrap_or_default().to_string_lossy();
-    format!("{}|{}|clip{}", name, std::fs::metadata(model).map_or(0, |m| m.len()), CLIP_SECONDS)
+    format!("{}|{}|clip{}|t{}", name, std::fs::metadata(model).map_or(0, |m| m.len()), CLIP_SECONDS, TRANSCRIBE_VERSION)
 }
 
 fn span_key((start, end): (f64, f64)) -> String {
@@ -188,17 +192,24 @@ impl Cache {
     // Returns how many were removed.
     pub fn clear(&self, audio: &[PathBuf]) -> Result<usize, String> {
         let Some(dir) = &self.dir else { return Ok(0) };
-        let targets: Vec<PathBuf> = if audio.is_empty() {
+        let mut targets: Vec<PathBuf> = if audio.is_empty() {
             std::fs::read_dir(dir)
                 .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| is_entry(p)).collect())
                 .unwrap_or_default()
         } else {
             audio.iter().filter_map(|a| fingerprint(a)).map(|fp| entry_path(dir, &fp)).filter(|p| p.is_file()).collect()
         };
+        targets.sort();
+        targets.dedup();
+        let mut removed = 0;
         for p in &targets {
-            std::fs::remove_file(p).map_err(|e| format!("Failed to remove '{}': {}", p.display(), e))?;
+            match std::fs::remove_file(p) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("Failed to remove '{}': {}", p.display(), e)),
+            }
         }
-        Ok(targets.len())
+        Ok(removed)
     }
 }
 
@@ -345,7 +356,28 @@ mod tests {
         assert!(cache_dir.join("notes.json").is_file());
         assert!(cache_dir.join("0123456789abcdef.txt").is_file());
         assert!(cache_dir.join("0123456789abcdef.json.tmp").is_file());
-        assert!(cache.silences(&wav, 2.0, -40.0).is_none());
+        assert!(cache.silences(&a, 2.0, -40.0).is_none(), "the stored entry was cleared");
+        assert!(wav.is_file());
+    }
+
+    #[test]
+    fn clear_with_the_same_entry_twice_removes_it_once() {
+        let dir = temp_dir("cache-dup");
+        let a = audio(&dir, "a.wav", 10);
+        let cache = cache_in(&dir);
+        cache.store_silences(&a, 2.0, -40.0, &[], 1.0);
+        assert_eq!(cache.clear(&[a.clone(), a.clone()]), Ok(1));
+        assert!(cache.silences(&a, 2.0, -40.0).is_none());
+    }
+
+    #[test]
+    fn different_spellings_of_a_path_share_an_entry() {
+        let dir = temp_dir("cache-canon");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let a = audio(&dir, "a.wav", 10);
+        let cache = cache_in(&dir);
+        cache.store_silences(&dir.join("sub/../a.wav"), 2.0, -40.0, &[], 1.0);
+        assert!(cache.silences(&a, 2.0, -40.0).is_some());
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub struct Args {
     /// Only this missing chapter (its number in the "No break found" list); repeatable
     #[arg(long = "chapter", value_name = "N")]
     pub chapters: Vec<usize>,
-    /// Don't read or write the transcript cache for this run
+    /// Don't read or write the cache (silences and transcripts) for this run
     #[arg(long)]
     pub no_cache: bool,
 }
