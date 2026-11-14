@@ -2,8 +2,9 @@
 // on the plan (unit-tested); the menu below only chooses which one to call.
 use super::time::{clock, parse_time};
 use super::{open_plan, place, prompt};
+use audiobook_splitter_rust::meta::Metadata;
 use audiobook_splitter_rust::plan::{Plan, PlanBreak};
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
@@ -26,10 +27,22 @@ pub fn is_fixed(b: &PlanBreak) -> bool {
     b.file == 0 && b.at <= 0.01
 }
 
+// Whether the chapters or tags differ from what the editor started with.
+fn changed(plan: &Plan, original: &(Vec<PlanBreak>, Metadata)) -> bool {
+    plan.findings.breaks != original.0 || plan.metadata != original.1
+}
+
 pub fn add(plan: &mut Plan, file: usize, at: f64, title: &str) -> Result<(), String> {
     let duration = plan.files.get(file).ok_or("There is no such audio file.")?.duration;
     if !(at >= 0.0 && at < duration) {
         return Err(format!("Enter a time between 0:00:00 and {}.", clock(duration)));
+    }
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("A chapter needs a title.".into());
+    }
+    if file == 0 && at <= 0.01 {
+        return Err("The book already starts with a chapter at 0:00:00.".into());
     }
     let breaks = &mut plan.findings.breaks;
     if breaks.iter().any(|b| same(pos(b), (file, at))) {
@@ -108,6 +121,10 @@ fn pick(prompt: &str, items: &[String]) -> Result<Option<usize>, String> {
     io(Select::with_theme(&ColorfulTheme::default()).with_prompt(prompt).items(items).default(0).interact_opt())
 }
 
+fn confirm(prompt: &str) -> Result<bool, String> {
+    io(Confirm::with_theme(&ColorfulTheme::default()).with_prompt(prompt).default(false).interact())
+}
+
 fn ask(prompt: &str, initial: &str, allow_empty: bool) -> Result<String, String> {
     io(Input::<String>::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
@@ -147,12 +164,19 @@ pub fn edit_plan(plan: &mut Plan) -> Result<bool, String> {
             Some(1) => report(add_at_time(plan)),
             Some(2) => report(add_at_silence(plan)),
             Some(3) => tags_menu(plan)?,
-            Some(4) => {
+            Some(4) if changed(plan, &original) => {
+                if !confirm("Discard all changes?")? {
+                    continue;
+                }
                 (plan.findings.breaks, plan.metadata) = original.clone();
                 println!("Changes discarded.");
             }
             Some(5) => return Ok(true),
-            Some(6) => return Ok(false),
+            Some(6) => {
+                if !changed(plan, &original) || confirm("Exit and lose your changes?")? {
+                    return Ok(false);
+                }
+            }
             _ => {} // Esc: stay, so a stray key can't lose the edits.
         }
     }
@@ -273,7 +297,6 @@ pub fn run(args: Args) -> Result<(), String> {
 mod tests {
     use super::*;
     use audiobook_splitter_rust::chapters::AudioFile;
-    use audiobook_splitter_rust::meta::Metadata;
     use audiobook_splitter_rust::plan::{Findings, PlanSilence, Settings};
 
     // One 100 s file, chapters at 0, 30 and 60 s, silences at 0, 10, 20, 30, 45, 60 and 80 s.
@@ -306,6 +329,28 @@ mod tests {
         assert!(add(&mut p, 0, 100.0, "Late").is_err());
         assert!(add(&mut p, 0, -1.0, "Early").is_err());
         assert!(add(&mut p, 3, 5.0, "Nofile").is_err());
+    }
+
+    #[test]
+    fn add_rejects_blank_titles_and_the_first_chapters_position() {
+        let mut p = plan();
+        assert!(add(&mut p, 0, 45.0, "  ").unwrap_err().contains("needs a title"));
+        assert!(add(&mut p, 0, 0.005, "Dup").unwrap_err().contains("already starts"));
+        assert_eq!(titles(&p), ["One", "Two", "Three"]);
+        add(&mut p, 0, 45.0, "  New ").unwrap();
+        assert_eq!(titles(&p)[2], "New");
+    }
+
+    #[test]
+    fn changed_compares_breaks_and_metadata_with_the_original() {
+        let mut p = plan();
+        let original = (p.findings.breaks.clone(), p.metadata.clone());
+        assert!(!changed(&p, &original));
+        rename(&mut p, 1, "Storm").unwrap();
+        assert!(changed(&p, &original));
+        p.findings.breaks = original.0.clone();
+        p.metadata.album = "Other".into();
+        assert!(changed(&p, &original));
     }
 
     #[test]

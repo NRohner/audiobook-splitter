@@ -45,7 +45,12 @@ pub fn run(args: Args) -> Result<(), String> {
     for ch in wanted {
         let found = plan.findings.found.clone();
         match rescan_one(ch, &plan.files, &found, &plan.settings, &epub, &transcriber, &mut |e| reporter.emit(e)) {
-            Ok(r) => plan.findings.apply_rescan(ch, chapter_title(&epub.chapters, ch), r.found, r.silences),
+            Ok(r) => {
+                plan.findings.apply_rescan(ch, chapter_title(&epub.chapters, ch), r.found, r.silences);
+                // Save as we go: an interrupted run loses at most the chapter in flight.
+                plan.sort_breaks();
+                plan.save(&args.plan)?;
+            }
             Err(e) => {
                 outcome = Err(e);
                 break;

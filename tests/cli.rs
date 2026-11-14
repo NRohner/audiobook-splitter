@@ -128,3 +128,14 @@ fn run_without_a_terminal_cannot_prompt() {
 fn the_old_cli_flag_still_works_as_run() {
     bin().arg("--cli").assert().failure().stderr(contains("interactive terminal"));
 }
+
+#[test]
+fn run_rejects_an_output_path_that_is_a_file_before_analyzing() {
+    let dir = common::temp_dir("run-bad-out");
+    let wav = dir.join("book.wav");
+    common::tone_with_gaps(&wav, 15, &[(4, 6), (9, 11)]);
+    let out = dir.join("out.txt");
+    fs::write(&out, "x").unwrap();
+    bin().arg("run").arg(&wav).arg("-o").arg(&out).arg("--yes").assert().failure().stderr(contains("is not a folder"));
+    assert_eq!(names(&dir), ["book.wav", "out.txt"]);
+}
