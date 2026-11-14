@@ -86,3 +86,9 @@ fn a_plan_whose_audio_changed_is_rejected() {
     common::tone_with_gaps(&wav, 40, &[]);
     bin().arg("split").arg(&plan).arg("-o").arg(dir.join("out")).assert().failure().stderr(contains("has changed"));
 }
+
+#[test]
+fn edit_needs_a_terminal() {
+    let (_, _, plan) = analyzed("edit-tty");
+    bin().arg("edit").arg(&plan).assert().failure().stderr(contains("interactive terminal"));
+}

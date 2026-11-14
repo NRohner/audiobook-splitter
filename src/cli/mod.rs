@@ -1,5 +1,6 @@
 // Command-line front end: one subcommand per step, joined by a plan file (see plan.rs).
 mod analyze;
+mod edit;
 mod progress;
 mod prompt;
 mod split;
@@ -33,6 +34,8 @@ enum Cmd {
     Analyze(analyze::Args),
     /// Write the tagged audio files described by a plan file
     Split(split::Args),
+    /// Review and change a plan's chapters, titles and tags (interactive)
+    Edit(edit::Args),
     /// Start the web GUI
     Gui,
 }
@@ -138,6 +141,7 @@ pub fn run(mut args: Vec<String>) {
     let result = match Cli::parse_from(args).cmd {
         Cmd::Analyze(a) => analyze::run(a),
         Cmd::Split(a) => split::run(a),
+        Cmd::Edit(a) => edit::run(a),
         Cmd::Gui => {
             crate::gui::run();
             Ok(())
