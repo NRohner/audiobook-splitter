@@ -58,8 +58,9 @@ fn fingerprint(audio: &Path) -> Option<String> {
     Some(format!("{:016x}", fnv1a(id.as_bytes())))
 }
 
+// Exact round-trip formatting, so settings that differ at all get different keys.
 fn settings_key(min_silence: f64, noise_db: f64) -> String {
-    format!("{:.3}|{:.3}", min_silence, noise_db)
+    format!("{}|{}", min_silence, noise_db)
 }
 
 fn model_key(model: &Path) -> String {
@@ -75,8 +76,10 @@ fn entry_path(dir: &Path, fingerprint: &str) -> PathBuf {
     dir.join(format!("{}.json", fingerprint))
 }
 
+// Only files named the way `entry_path` names them: 16 lowercase hex digits, then `.json`.
 fn is_entry(path: &Path) -> bool {
-    path.extension().is_some_and(|e| e == "json")
+    let is_fingerprint = |s: &str| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    path.extension().is_some_and(|e| e == "json") && path.file_stem().and_then(|s| s.to_str()).is_some_and(is_fingerprint)
 }
 
 // What the file holds, or an empty entry if it is missing, unreadable or from another version.
@@ -125,16 +128,20 @@ impl Cache {
         let fp = fingerprint(audio)?;
         let mut entry = load_entry(dir, &fp);
         change(&mut entry);
+        // The process id keeps two processes writing the same entry off each other's temp file.
+        let tmp = dir.join(format!("{}.{}.json.tmp", fp, std::process::id()));
         let write = || -> std::io::Result<()> {
             std::fs::create_dir_all(dir)?;
-            let tmp = dir.join(format!("{}.json.tmp", fp));
             std::fs::write(&tmp, serde_json::to_vec(&entry).map_err(std::io::Error::other)?)?;
             std::fs::rename(&tmp, entry_path(dir, &fp))
         };
         match write() {
             Ok(()) => None,
-            Err(e) => (!self.warned.swap(true, Ordering::Relaxed))
-                .then(|| format!("Cache not saved ({}): {}. Continuing without it.", dir.display(), e)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                (!self.warned.swap(true, Ordering::Relaxed))
+                .then(|| format!("Cache not saved ({}): {}. Continuing without it.", dir.display(), e))
+            }
         }
     }
 
@@ -309,6 +316,35 @@ mod tests {
         let first = cache.store_silences(&wav, 2.0, -40.0, &[], 1.0);
         assert!(first.is_some_and(|w| w.contains("Cache not saved")));
         assert!(cache.store_silences(&wav, 2.0, -40.0, &[], 1.0).is_none());
+        assert!(cache.silences(&wav, 2.0, -40.0).is_none());
+    }
+
+    #[test]
+    fn a_setting_that_differs_past_three_decimals_misses() {
+        let dir = temp_dir("cache-key");
+        let wav = audio(&dir, "a.wav", 10);
+        let cache = cache_in(&dir);
+        cache.store_silences(&wav, 2.0, -40.0, &[silence(4.0, 6.0)], 15.0);
+        assert!(cache.silences(&wav, 2.0, -40.0).is_some());
+        assert!(cache.silences(&wav, 2.0004, -40.0).is_none(), "min silence is keyed exactly");
+    }
+
+    #[test]
+    fn info_and_clear_ignore_files_that_are_not_entries() {
+        let dir = temp_dir("cache-foreign");
+        let (a, wav) = (audio(&dir, "a.wav", 10), audio(&dir, "b.wav", 10));
+        let cache = cache_in(&dir);
+        cache.store_silences(&a, 2.0, -40.0, &[], 1.0);
+        let cache_dir = dir.join("cache");
+        std::fs::write(cache_dir.join("notes.json"), "mine").unwrap();
+        std::fs::write(cache_dir.join("0123456789abcdef.txt"), "mine").unwrap();
+        std::fs::write(cache_dir.join("0123456789abcdef.json.tmp"), "half written").unwrap();
+
+        assert_eq!(cache.info().entries, 1, "only the real entry counts");
+        assert_eq!(cache.clear(&[]), Ok(1), "only the real entry is removed");
+        assert!(cache_dir.join("notes.json").is_file());
+        assert!(cache_dir.join("0123456789abcdef.txt").is_file());
+        assert!(cache_dir.join("0123456789abcdef.json.tmp").is_file());
         assert!(cache.silences(&wav, 2.0, -40.0).is_none());
     }
 
