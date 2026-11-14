@@ -92,3 +92,19 @@ fn edit_needs_a_terminal() {
     let (_, _, plan) = analyzed("edit-tty");
     bin().arg("edit").arg(&plan).assert().failure().stderr(contains("interactive terminal"));
 }
+
+#[test]
+fn rescan_needs_a_plan_made_with_an_epub() {
+    let (_, _, plan) = analyzed("rescan-no-epub");
+    bin().arg("rescan").arg(&plan).assert().failure().stderr(contains("without an EPUB"));
+}
+
+#[test]
+fn preview_writes_a_clip_from_the_chosen_break() {
+    let (dir, _, plan) = analyzed("preview");
+    let clip = dir.join("clip.mp3");
+    bin().arg("preview").arg(&plan).arg("2").arg("-o").arg(&clip).assert().success().stdout(contains("clip.mp3"));
+    assert!(fs::read(&clip).unwrap().starts_with(b"ID3"));
+    bin().arg("preview").arg(&plan).arg("9").arg("-o").arg(&clip).assert().failure().stderr(contains("no chapter 9"));
+    bin().arg("preview").arg(&plan).arg("0").arg("-o").arg(&clip).assert().failure().stderr(contains("no chapter 0"));
+}

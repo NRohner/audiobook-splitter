@@ -1,8 +1,10 @@
 // Command-line front end: one subcommand per step, joined by a plan file (see plan.rs).
 mod analyze;
 mod edit;
+mod preview;
 mod progress;
 mod prompt;
+mod rescan;
 mod split;
 mod time;
 
@@ -36,6 +38,10 @@ enum Cmd {
     Split(split::Args),
     /// Review and change a plan's chapters, titles and tags (interactive)
     Edit(edit::Args),
+    /// Look again for chapters the EPUB match missed
+    Rescan(rescan::Args),
+    /// Cut the audio after a chapter break to a file, to check it by ear
+    Preview(preview::Args),
     /// Start the web GUI
     Gui,
 }
@@ -142,6 +148,8 @@ pub fn run(mut args: Vec<String>) {
         Cmd::Analyze(a) => analyze::run(a),
         Cmd::Split(a) => split::run(a),
         Cmd::Edit(a) => edit::run(a),
+        Cmd::Rescan(a) => rescan::run(a),
+        Cmd::Preview(a) => preview::run(a),
         Cmd::Gui => {
             crate::gui::run();
             Ok(())
