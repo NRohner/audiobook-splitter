@@ -108,3 +108,23 @@ fn preview_writes_a_clip_from_the_chosen_break() {
     bin().arg("preview").arg(&plan).arg("9").arg("-o").arg(&clip).assert().failure().stderr(contains("no chapter 9"));
     bin().arg("preview").arg(&plan).arg("0").arg("-o").arg(&clip).assert().failure().stderr(contains("no chapter 0"));
 }
+
+#[test]
+fn run_chains_analyze_and_split() {
+    let dir = common::temp_dir("run");
+    let wav = dir.join("book.wav");
+    common::tone_with_gaps(&wav, 15, &[(4, 6), (9, 11)]);
+    let out = dir.join("out");
+    bin().arg("run").arg(&wav).arg("-o").arg(&out).args(["--min-silence", "1", "--yes"]).assert().success().stdout(contains("Wrote 3 file(s)"));
+    assert_eq!(names(&out), ["00 - Part 1.wav", "01 - Part 2.wav", "02 - Part 3.wav", "plan.json"]);
+}
+
+#[test]
+fn run_without_a_terminal_cannot_prompt() {
+    bin().arg("run").assert().failure().stderr(contains("interactive terminal"));
+}
+
+#[test]
+fn the_old_cli_flag_still_works_as_run() {
+    bin().arg("--cli").assert().failure().stderr(contains("interactive terminal"));
+}

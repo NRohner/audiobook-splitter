@@ -2,7 +2,7 @@
 
 ---
 
-A Rust application (local web GUI plus an interactive CLI) that intelligently splits long audio files (MP3, M4B, WAV, FLAC, AAC, M4A or OGG) into smaller segments. It achieves this by scanning the audio for periods of silence that exceed a user-defined threshold and then splitting the file at the midpoint of these detected silences, preventing abrupt audio clipping.
+A Rust application (local web GUI plus a full command-line interface that works over SSH) that intelligently splits long audio files (MP3, M4B, WAV, FLAC, AAC, M4A or OGG) into smaller segments. It achieves this by scanning the audio for periods of silence that exceed a user-defined threshold and then splitting the file at the midpoint of these detected silences, preventing abrupt audio clipping.
 
 ## Features
 
@@ -77,7 +77,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
     [Environment]::SetEnvironmentVariable("CARGO_TARGET_DIR", "C:\abs-target", "User")
     ```
 
-    The Vulkan SDK installer sets `VULKAN_SDK` for you. `CARGO_TARGET_DIR` moves the build folder to a short path: whisper.cpp's GPU code builds files nested so deep that, under the repo's `target\` folder, they pass Windows' 260-character path limit and the build fails. The built binary is then `C:\abs-target\release\audiobook-splitter-rust.exe`; run it (or `cargo run`) from the repo folder so it finds `models\`.
+    The Vulkan SDK installer sets `VULKAN_SDK` for you. `CARGO_TARGET_DIR` moves the build folder to a short path: whisper.cpp's GPU code builds files nested so deep that, under the repo's `target\` folder, they pass Windows' 260-character path limit and the build fails. The built binary is then `C:\abs-target\release\audiobook-splitter-rust.exe`; run it (or `cargo run -- gui`) from the repo folder so it finds `models\`.
 
     Nothing GPU-specific is needed to *run* the app: your graphics driver already includes Vulkan. Without a usable GPU, Whisper falls back to the CPU (roughly 50 times slower).
 
@@ -115,7 +115,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
     cd audiobook-splitter
     mkdir models
     curl.exe -L --fail -o models\ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-    cargo run --release   # builds the release binary, opens the GUI
+    cargo run --release -- gui   # builds the release binary, opens the GUI
     ```
 
     Use `curl.exe`, not `curl`: in Windows PowerShell 5, `curl` is an alias for `Invoke-WebRequest`, which takes different arguments.
@@ -125,11 +125,11 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
 | macOS | Windows (PowerShell) | What it does |
 |---|---|---|
 | `make model` | see step 5 above | One-time: download the Whisper model into `models/` |
-| `make dev` | `cargo run` | Debug build, starts the GUI and opens your browser |
+| `make dev` | `cargo run -- gui` | Debug build, starts the GUI and opens your browser |
 | `make build` | `cargo build --release` | Optimized single binary at `target/release/audiobook-splitter-rust` (`C:\abs-target\release\audiobook-splitter-rust.exe` on Windows) |
-| `make run` | `cargo run --release` | Build and launch the release GUI |
+| `make run` | `cargo run --release -- gui` | Build and launch the release GUI |
 | `make test` | `cargo test` | Run the test suite |
-| `make cli` | `cargo run -- --cli` | Original interactive terminal flow |
+| `make cli` | `cargo run -- run` | Guided terminal session |
 
 The GUI is a local web page served by the app itself at `http://127.0.0.1:7878` (it only listens on your machine). Pick an audio file or folder and an output folder (type a path or use the native **File** / **Folder** / **Browse** dialogs), set the detection thresholds, click **Analyze**, tweak and re-analyze until the segment counts look right, then click **Split files**.
 
@@ -141,37 +141,31 @@ The binary is self-contained (the page is compiled in); FFmpeg/FFprobe still nee
 2. Use a *looser* minimum silence than usual (e.g. 1.0-2.0 s): silences are only candidates now, and the transcript match decides which are real chapter breaks.
 3. Click **Analyze**. The results list each chapter break with a score (0-2: how well the speech after the pause matches the chapter's opening, plus how well the speech before it matches the previous chapter's ending) and what Whisper heard. Chapters with no match are listed; front matter like the copyright page usually isn't narrated, so that's expected.
 4. If real chapters are missing, lower the minimum silence or the **Chapter match threshold** (default 0.4) and analyze again.
-5. **Split files** writes one file per chapter. A chapter that crosses an audio file boundary becomes `NN - Title (part 2)`, and anything before the first chapter is `00 - Opening`. Run it with `--cli` for the terminal version.
+5. **Split files** writes one file per chapter. A chapter that crosses an audio file boundary becomes `NN - Title (part 2)`, and anything before the first chapter is `00 - Opening`. The CLI does the same with `analyze --epub`.
 
 ## Usage (CLI)
 
-1.  **Compile and Run the Application:**
-    In the project's root directory, run:
+The CLI does everything the GUI does, step by step, joined by a plan file. It works over SSH: nothing needs a display. Run `audiobook-splitter-rust --help` (or `cargo run -- --help`) for the commands, and `<command> --help` for each one's flags.
 
-    ```bash
-    make cli             # macOS
-    cargo run -- --cli   # Windows
-    ```
+| Command | What it does |
+|---|---|
+| `analyze <input>` | Detect silences (and match EPUB chapters with `--epub`), write `plan.json` |
+| `rescan <plan>` | Look again for chapters the EPUB match missed (`--chapter N` for one) |
+| `edit <plan>` | Interactive menu: rename, remove, add or move chapters, edit tags and file naming |
+| `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
+| `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, ...) |
+| `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
+| `gui` | Start the web GUI |
 
-2.  **Follow the Prompts:**
-    The application will guide you through the process:
+A typical remote session:
 
-    * **Audio File Path:** Enter the full path to the audio file you want to split (e.g., `~/Music/long_podcast.mp3` on macOS, `C:\Users\YourName\Music\long_podcast.mp3` on Windows, or `audio.wav`).
+```bash
+audiobook-splitter-rust analyze ~/books/mybook/ --epub mybook.epub --min-silence 1.5 -o mybook.plan.json
+audiobook-splitter-rust edit mybook.plan.json
+audiobook-splitter-rust split mybook.plan.json -o ~/books/mybook-split
+```
 
-    * **Minimum Silence Length:** Enter the minimum duration in seconds that a silence must be to be considered a split point (e.g., `0.5`, `2.0`).
-
-    * **Noise Threshold (dB):** Enter the noise threshold in decibels (e.g., `-40.0`). A less negative value (e.g., `-30.0` or `-20.0`) will make FFmpeg more lenient, considering quieter sounds as part of a silence. A good starting point is often **-40.0dB**.
-
-    * **Review and Act:** After detection, the application will tell you how many audio segments were identified. You will then be prompted to:
-
-        * `(r)` **Re-analyze:** If the number of segments isn't what you expected, choose `r` to try different silence and noise threshold settings.
-
-        * `(p)` **Proceed:** If you're satisfied with the detected split points, choose `p` to proceed with splitting the audio file.
-
-    * **Output Prefix:** Enter the desired path and file name prefix for the split audio files (e.g., `output/part`). If the directory doesn't exist, you'll be asked if you want to create it. The application will append a sequential number and the original file's extension (e.g., `output/part_001.mp3`, `output/part_002.mp3`).
-
-3.  **Completion:**
-    The application will provide status updates as it splits the file. Once finished, it will confirm completion and ask if you wish to process another file.
+Transcription is the slow step; the plan file means you do it once and can edit and split later (run it in `tmux` so a dropped connection doesn't lose it). A plan records the audio files it was made from and is rejected if they change. `run` with no arguments (or the old `--cli` flag) asks for the input, output and an optional EPUB. Running the binary with no arguments prints the help; the GUI needs `gui`.
 
 ## Troubleshooting and Tips
 

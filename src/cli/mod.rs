@@ -5,6 +5,7 @@ mod preview;
 mod progress;
 mod prompt;
 mod rescan;
+mod run;
 mod split;
 mod time;
 
@@ -42,6 +43,8 @@ enum Cmd {
     Rescan(rescan::Args),
     /// Cut the audio after a chapter break to a file, to check it by ear
     Preview(preview::Args),
+    /// Analyze, review and split in one go (prompts for anything left out)
+    Run(run::Args),
     /// Start the web GUI
     Gui,
 }
@@ -150,6 +153,7 @@ pub fn run(mut args: Vec<String>) {
         Cmd::Edit(a) => edit::run(a),
         Cmd::Rescan(a) => rescan::run(a),
         Cmd::Preview(a) => preview::run(a),
+        Cmd::Run(a) => run::run(a),
         Cmd::Gui => {
             crate::gui::run();
             Ok(())
