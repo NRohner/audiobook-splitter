@@ -155,6 +155,7 @@ The CLI does everything the GUI does, step by step, joined by a plan file. It wo
 | `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
 | `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, ...) |
 | `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
+| `cache info` / `cache clear [path]` | Show or empty the cache of silences and transcripts (see below) |
 | `gui` | Start the web GUI |
 
 A typical remote session:
@@ -166,6 +167,19 @@ audiobook-splitter-rust split mybook.plan.json -o ~/books/mybook-split
 ```
 
 Transcription is the slow step; the plan file means you do it once and can edit and split later (run it in `tmux` so a dropped connection doesn't lose it). A plan records the audio files it was made from and is rejected if they change. `run` with no arguments (or the old `--cli` flag) asks for the input, output and an optional EPUB. Running the binary with no arguments prints the help; the GUI needs `gui`.
+
+### Resuming and the cache
+
+Silence detection and Whisper transcription are cached on disk, keyed by each audio file (path, size, modified time) and the model, so an interrupted `analyze` picks up where it stopped (at most the last 64 transcriptions are redone), and re-analyzing with a different `--threshold` or re-running `rescan` reuses everything already transcribed. The GUI uses the same cache.
+
+```bash
+audiobook-splitter-rust cache info                  # where it is and how big
+audiobook-splitter-rust cache clear                 # delete everything
+audiobook-splitter-rust cache clear ~/books/mybook  # delete just this book's entries
+audiobook-splitter-rust analyze book/ --no-cache    # ignore the cache for one run
+```
+
+The folder is `~/Library/Caches/audiobook-splitter` (macOS), `$XDG_CACHE_HOME` or `~/.cache/audiobook-splitter` (Linux) or `%LOCALAPPDATA%\audiobook-splitter\cache` (Windows); set `AUDIOBOOK_CACHE_DIR` to put it elsewhere. Entries never expire: a changed audio file or a different model simply doesn't match, so `cache clear` is only for reclaiming space.
 
 ## Troubleshooting and Tips
 

@@ -182,3 +182,39 @@ fn no_cache_leaves_the_cache_alone() {
     let again = analyze_stderr(&wav, &dir.join("c.json"), &cache, &["--no-cache"]);
     assert!(!again.contains("from cache"), "{}", again);
 }
+
+#[test]
+fn cache_info_and_clear() {
+    let dir = common::temp_dir("cache-cmd");
+    let wav = dir.join("book.wav");
+    common::tone_with_gaps(&wav, 15, &[(4, 6), (9, 11)]);
+    let cache = dir.join("cache");
+    let cmd = |args: &[&str]| {
+        let mut c = bin();
+        c.env("AUDIOBOOK_CACHE_DIR", &cache).arg("cache").args(args);
+        c
+    };
+
+    cmd(&["info"]).assert().success().stdout(contains("Cache folder:")).stdout(contains("0 book file(s)"));
+    analyze_stderr(&wav, &dir.join("a.json"), &cache, &[]);
+    cmd(&["info"]).assert().success().stdout(contains("1 book file(s)"));
+
+    cmd(&["clear", wav.to_str().unwrap()]).assert().success().stdout(contains("Removed 1 cache entry"));
+    cmd(&["clear", wav.to_str().unwrap()]).assert().success().stdout(contains("Removed 0 cache entries"));
+
+    analyze_stderr(&wav, &dir.join("b.json"), &cache, &[]);
+    cmd(&["clear"]).assert().success().stdout(contains("Removed 1 cache entry"));
+    cmd(&["info"]).assert().success().stdout(contains("0 book file(s)"));
+}
+
+#[test]
+fn cache_clear_rejects_a_missing_path() {
+    let dir = common::temp_dir("cache-missing");
+    bin()
+        .env("AUDIOBOOK_CACHE_DIR", dir.join("cache"))
+        .args(["cache", "clear"])
+        .arg(dir.join("nothere.wav"))
+        .assert()
+        .failure()
+        .stderr(contains("not a file or folder"));
+}

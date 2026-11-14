@@ -1,5 +1,6 @@
 // Command-line front end: one subcommand per step, joined by a plan file (see plan.rs).
 mod analyze;
+mod cache;
 mod edit;
 mod preview;
 mod progress;
@@ -46,6 +47,8 @@ enum Cmd {
     Preview(preview::Args),
     /// Analyze, review and split in one go (prompts for anything left out)
     Run(run::Args),
+    /// Show or empty the cache of silences and transcripts
+    Cache(cache::Args),
     /// Start the web GUI
     Gui,
 }
@@ -163,6 +166,7 @@ pub fn run(mut args: Vec<String>) {
         Cmd::Rescan(a) => rescan::run(a),
         Cmd::Preview(a) => preview::run(a),
         Cmd::Run(a) => run::run(a),
+        Cmd::Cache(a) => cache::run(a),
         Cmd::Gui => {
             crate::gui::run();
             Ok(())
