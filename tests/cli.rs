@@ -139,3 +139,46 @@ fn run_rejects_an_output_path_that_is_a_file_before_analyzing() {
     bin().arg("run").arg(&wav).arg("-o").arg(&out).arg("--yes").assert().failure().stderr(contains("is not a folder"));
     assert_eq!(names(&dir), ["book.wav", "out.txt"]);
 }
+
+// Runs `analyze` with the cache in `cache` and returns stderr, where progress logs go.
+fn analyze_stderr(wav: &std::path::Path, plan: &std::path::Path, cache: &std::path::Path, extra: &[&str]) -> String {
+    let out = bin()
+        .env("AUDIOBOOK_CACHE_DIR", cache)
+        .arg("analyze")
+        .arg(wav)
+        .args(["--min-silence", "1", "-o"])
+        .arg(plan)
+        .args(extra)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn a_second_analyze_reuses_the_cached_silences() {
+    let dir = common::temp_dir("cache-reuse");
+    let wav = dir.join("book.wav");
+    common::tone_with_gaps(&wav, 15, &[(4, 6), (9, 11)]);
+    let cache = dir.join("cache");
+    let first = analyze_stderr(&wav, &dir.join("a.json"), &cache, &[]);
+    assert!(!first.contains("from cache"), "{}", first);
+    let second = analyze_stderr(&wav, &dir.join("b.json"), &cache, &[]);
+    assert!(second.contains("silences from cache"), "{}", second);
+    assert!(cache.is_dir());
+}
+
+#[test]
+fn no_cache_leaves_the_cache_alone() {
+    let dir = common::temp_dir("cache-off");
+    let wav = dir.join("book.wav");
+    common::tone_with_gaps(&wav, 15, &[(4, 6), (9, 11)]);
+    let cache = dir.join("cache");
+    analyze_stderr(&wav, &dir.join("a.json"), &cache, &["--no-cache"]);
+    assert!(!cache.exists(), "--no-cache must not create the cache folder");
+    analyze_stderr(&wav, &dir.join("b.json"), &cache, &[]); // Fills it.
+    let again = analyze_stderr(&wav, &dir.join("c.json"), &cache, &["--no-cache"]);
+    assert!(!again.contains("from cache"), "{}", again);
+}

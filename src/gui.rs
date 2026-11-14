@@ -2,11 +2,11 @@
 // Native file dialogs run in a child process (`--pick`), so this process never becomes
 // a Cocoa app whose unpumped event loop macOS would flag as not responding;
 // analysis and splitting run on a background thread and the page polls /status.
+use audiobook_splitter_rust::cache::Cache;
 use audiobook_splitter_rust::chapters::{AudioFile, Break};
 use audiobook_splitter_rust::meta::Metadata;
-use audiobook_splitter_rust::pipeline::{self, default_metadata, file_name, open_epub, EpubInput, Event, PREVIEW_SECONDS};
+use audiobook_splitter_rust::pipeline::{self, default_metadata, file_name, open_epub, EpubInput, Event, LazyTranscriber, PREVIEW_SECONDS};
 use audiobook_splitter_rust::plan::{Findings, Settings};
-use audiobook_splitter_rust::transcribe::Transcriber;
 use audiobook_splitter_rust::{collect_inputs, preview_clip, user_path, AUDIO_EXTENSIONS};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -101,8 +101,9 @@ pub fn run() {
     open_browser(&url);
 
     let state: Shared = Arc::default();
+    let cache = Arc::new(Cache::open(Cache::default_dir()));
     for req in server.incoming_requests() {
-        handle(req, &state, port);
+        handle(req, &state, &cache, port);
     }
 }
 
@@ -119,7 +120,7 @@ fn open_browser(url: &str) {
     }
 }
 
-fn handle(mut req: Request, state: &Shared, port: u16) {
+fn handle(mut req: Request, state: &Shared, cache: &Arc<Cache>, port: u16) {
     // Only answer requests addressed to us, so other websites can't drive the
     // app (DNS rebinding). POSTs must be JSON, which forces a CORS preflight
     // that we never approve, so cross-site form posts are rejected too.
@@ -151,8 +152,8 @@ fn handle(mut req: Request, state: &Shared, port: u16) {
             Err(e) => Err(e),
         },
         (Method::Post, "/browse") => parse(&body).and_then(browse),
-        (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state)),
-        (Method::Post, "/rescan") => parse(&body).and_then(|r| start_rescan(r, state)),
+        (Method::Post, "/analyze") => parse(&body).and_then(|r| start_analyze(r, state, cache)),
+        (Method::Post, "/rescan") => parse(&body).and_then(|r| start_rescan(r, state, cache)),
         (Method::Post, "/split") => parse(&body).and_then(|r| start_split(r, state)),
         _ => {
             let _ = req.respond(Response::from_string("Not found").with_status_code(404));
@@ -256,7 +257,7 @@ fn apply_event(state: &Shared, event: Event) {
     }
 }
 
-fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
+fn start_analyze(req: AnalyzeReq, state: &Shared, cache: &Arc<Cache>) -> Result<Value, String> {
     let settings = Settings { min_silence: req.min_silence, noise_db: req.noise_db, threshold: req.threshold };
     settings.validate()?;
     let inputs = collect_inputs(&user_path(&req.input))?;
@@ -294,8 +295,9 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
     }
 
     let state = state.clone();
+    let cache = cache.clone();
     thread::spawn(move || {
-        let result = pipeline::analyze(&inputs, &settings, epub.as_ref(), &mut |e| apply_event(&state, e));
+        let result = pipeline::analyze(&inputs, &settings, epub.as_ref(), &cache, &mut |e| apply_event(&state, e));
         let mut s = state.lock().unwrap();
         match result {
             Ok(a) => {
@@ -317,7 +319,7 @@ fn start_analyze(req: AnalyzeReq, state: &Shared) -> Result<Value, String> {
 
 // Looks again for missing chapters, in book order, between the chapters found either
 // side of each, with a shorter minimum silence and a higher noise threshold.
-fn start_rescan(req: RescanReq, state: &Shared) -> Result<Value, String> {
+fn start_rescan(req: RescanReq, state: &Shared, cache: &Arc<Cache>) -> Result<Value, String> {
     let (epub, files, mut chapters) = {
         let mut s = state.lock().unwrap();
         if s.running {
@@ -338,16 +340,18 @@ fn start_rescan(req: RescanReq, state: &Shared) -> Result<Value, String> {
     chapters.dedup();
 
     let state = state.clone();
+    let cache = cache.clone();
     thread::spawn(move || {
-        let result = Transcriber::load(&epub.input.model).and_then(|transcriber| {
+        let mut transcriber = LazyTranscriber::new(&epub.input.model);
+        let result = (|| -> Result<(), String> {
             for ch in chapters {
                 let found = state.lock().unwrap().findings.found.clone();
-                let r = pipeline::rescan_one(ch, &files, &found, &epub.settings, &epub.input, &transcriber, &mut |e| apply_event(&state, e))?;
+                let r = pipeline::rescan_one(ch, &files, &found, &epub.settings, &epub.input, &mut transcriber, &cache, &mut |e| apply_event(&state, e))?;
                 let title = pipeline::chapter_title(&epub.input.chapters, ch);
                 state.lock().unwrap().findings.apply_rescan(ch, title, r.found, r.silences);
             }
             Ok(())
-        });
+        })();
         let mut s = state.lock().unwrap();
         if let Err(e) = result {
             s.log.push(format!("Error: {}", e));

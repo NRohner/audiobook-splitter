@@ -9,6 +9,7 @@ mod run;
 mod split;
 mod time;
 
+use audiobook_splitter_rust::cache::Cache;
 use audiobook_splitter_rust::meta::Metadata;
 use audiobook_splitter_rust::pipeline::file_name;
 use audiobook_splitter_rust::plan::{Plan, Settings};
@@ -49,6 +50,11 @@ enum Cmd {
     Gui,
 }
 
+// The shared cache, unless `--no-cache` asked for a run without it.
+pub fn open_cache(no_cache: bool) -> Cache {
+    if no_cache { Cache::disabled() } else { Cache::open(Cache::default_dir()) }
+}
+
 // Shared by `analyze` and `run`.
 #[derive(clap::Args)]
 pub struct Detect {
@@ -64,6 +70,9 @@ pub struct Detect {
     /// Minimum EPUB match score, 0 to 1
     #[arg(long, default_value_t = 0.4)]
     pub threshold: f64,
+    /// Don't read or write the transcript cache for this run
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 impl Detect {

@@ -1,9 +1,8 @@
 // `rescan`: look again for the chapters the match missed, with looser silence settings.
 use super::analyze::summary;
 use super::progress::Reporter;
-use super::{check_tools, open_plan};
-use audiobook_splitter_rust::pipeline::{chapter_title, open_epub, rescan_one};
-use audiobook_splitter_rust::transcribe::Transcriber;
+use super::{check_tools, open_cache, open_plan};
+use audiobook_splitter_rust::pipeline::{chapter_title, open_epub, rescan_one, LazyTranscriber};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -13,6 +12,9 @@ pub struct Args {
     /// Only this missing chapter (its number in the "No break found" list); repeatable
     #[arg(long = "chapter", value_name = "N")]
     pub chapters: Vec<usize>,
+    /// Don't read or write the transcript cache for this run
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 pub fn run(args: Args) -> Result<(), String> {
@@ -39,12 +41,13 @@ pub fn run(args: Args) -> Result<(), String> {
     wanted.sort();
     wanted.dedup();
 
-    let transcriber = Transcriber::load(&epub.model)?;
+    let cache = open_cache(args.no_cache);
+    let mut transcriber = LazyTranscriber::new(&epub.model);
     let mut reporter = Reporter::new();
     let mut outcome = Ok(());
     for ch in wanted {
         let found = plan.findings.found.clone();
-        match rescan_one(ch, &plan.files, &found, &plan.settings, &epub, &transcriber, &mut |e| reporter.emit(e)) {
+        match rescan_one(ch, &plan.files, &found, &plan.settings, &epub, &mut transcriber, &cache, &mut |e| reporter.emit(e)) {
             Ok(r) => {
                 plan.findings.apply_rescan(ch, chapter_title(&epub.chapters, ch), r.found, r.silences);
                 // Save as we go: an interrupted run loses at most the chapter in flight.

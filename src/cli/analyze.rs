@@ -1,6 +1,6 @@
 // `analyze`: detect silences, optionally match the EPUB, write the plan.
 use super::progress::Reporter;
-use super::{check_tools, place, Detect};
+use super::{check_tools, open_cache, place, Detect};
 use audiobook_splitter_rust::collect_inputs;
 use audiobook_splitter_rust::pipeline::{analyze, default_metadata, open_epub};
 use audiobook_splitter_rust::plan::Plan;
@@ -43,7 +43,8 @@ pub fn build_plan(input: &Path, detect: &Detect) -> Result<Plan, String> {
     };
 
     let mut reporter = Reporter::new();
-    let result = analyze(&inputs, &settings, epub.as_ref(), &mut |e| reporter.emit(e));
+    let cache = open_cache(detect.no_cache);
+    let result = analyze(&inputs, &settings, epub.as_ref(), &cache, &mut |e| reporter.emit(e));
     reporter.finish();
     let analysis = result?;
     if analysis.files.is_empty() {
