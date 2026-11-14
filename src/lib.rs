@@ -3,8 +3,13 @@ pub mod book;
 pub mod chapters;
 pub mod matching;
 pub mod meta;
+pub mod pipeline;
+pub mod plan;
+#[cfg(test)]
+mod testutil;
 pub mod transcribe;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -20,7 +25,7 @@ pub fn user_path(input: &str) -> PathBuf {
 }
 
 // A detected silence region, in seconds.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Silence {
     pub start: f64,
     pub end: f64,
@@ -115,13 +120,8 @@ pub fn next_file_index(dir: &Path, stem: &str, ext: &str) -> Result<usize, Strin
     Ok(max_index + 1)
 }
 
-// Runs FFmpeg silence detection and FFprobe, returning the silences and total duration.
-pub fn detect_silences(
-    input: &Path,
-    min_silence: f64,
-    noise_db: f64,
-) -> Result<(Vec<Silence>, f64), String> {
-    let silences = silencedetect(input, &[], min_silence, noise_db)?;
+// Total length of `input` in seconds, from FFprobe.
+pub fn probe_duration(input: &Path) -> Result<f64, String> {
     let probe = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1"])
         .arg(input)
@@ -131,12 +131,20 @@ pub fn detect_silences(
     if !probe.status.success() {
         return Err(format!("FFprobe failed:\n{}", String::from_utf8_lossy(&probe.stderr)));
     }
-    let total_duration = String::from_utf8_lossy(&probe.stdout)
+    String::from_utf8_lossy(&probe.stdout)
         .trim()
         .parse::<f64>()
-        .map_err(|e| format!("Failed to parse audio duration: {}", e))?;
+        .map_err(|e| format!("Failed to parse audio duration: {}", e))
+}
 
-    Ok((silences, total_duration))
+// Runs FFmpeg silence detection and FFprobe, returning the silences and total duration.
+pub fn detect_silences(
+    input: &Path,
+    min_silence: f64,
+    noise_db: f64,
+) -> Result<(Vec<Silence>, f64), String> {
+    let silences = silencedetect(input, &[], min_silence, noise_db)?;
+    Ok((silences, probe_duration(input)?))
 }
 
 // Silences between `from` and `to` seconds of `input`, in times from the file's start.
