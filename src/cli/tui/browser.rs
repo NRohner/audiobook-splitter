@@ -167,6 +167,7 @@ impl Browser {
         if self.typed.is_some() {
             return self.key_typed(key);
         }
+        self.error.clear();
         if self.filtering {
             self.key_filter(key);
             return BrowserOutcome::Continue;
@@ -216,6 +217,7 @@ impl Browser {
     }
 
     fn key_filter(&mut self, key: KeyEvent) {
+        let before = self.filter.clone();
         match key.code {
             KeyCode::Esc => {
                 self.filter.clear();
@@ -230,7 +232,9 @@ impl Browser {
             KeyCode::Char(c) => self.filter.push(c),
             _ => {}
         }
-        self.selected = 0;
+        if self.filter != before {
+            self.selected = 0;
+        }
     }
 
     fn key_typed(&mut self, key: KeyEvent) -> BrowserOutcome {
@@ -248,7 +252,7 @@ impl Browser {
                         return BrowserOutcome::Chosen(path);
                     }
                     self.enter(path);
-                } else if path.is_file() && (self.pick.extensions().is_empty() || wanted(&path.to_string_lossy(), self.pick.extensions())) {
+                } else if path.is_file() && !matches!(self.pick, Pick::Folder) && wanted(&path.to_string_lossy(), self.pick.extensions()) {
                     return BrowserOutcome::Chosen(path);
                 } else {
                     self.error = format!("'{}' was not found (or is not a type you can pick here).", path.display());
@@ -439,6 +443,59 @@ mod tests {
         assert!(bad.error.contains("not found"));
         assert!(matches!(bad.handle_key(k(KeyCode::Esc)), BrowserOutcome::Continue), "Esc leaves typing mode first");
         assert!(matches!(bad.handle_key(k(KeyCode::Esc)), BrowserOutcome::Cancel));
+    }
+
+    fn type_path(b: &mut Browser, path: &Path) {
+        b.handle_key(k(KeyCode::Tab));
+        b.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in path.to_str().unwrap().chars() {
+            b.handle_key(ch(c));
+        }
+    }
+
+    #[test]
+    fn a_folder_only_browser_refuses_a_typed_file_path() {
+        let dir = tree("typedfolderonly");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), Pick::Folder);
+        type_path(&mut b, &dir.join("x.mp3"));
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue));
+        assert!(b.error.contains("not found"));
+    }
+
+    #[test]
+    fn a_file_browser_accepts_a_typed_file_only_when_the_extension_matches() {
+        let dir = tree("typedfile");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        type_path(&mut b, &dir.join("x.mp3"));
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Chosen(p) if p == dir.join("x.mp3")));
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        type_path(&mut b, &dir.join("y.txt"));
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue));
+        assert!(b.error.contains("not found"));
+    }
+
+    #[test]
+    fn navigation_keys_in_the_filter_box_do_not_reset_the_selection() {
+        let dir = tree("filternav");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        b.handle_key(k(KeyCode::End));
+        b.handle_key(ch('/'));
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::PageDown, KeyCode::PageUp] {
+            b.handle_key(k(code));
+            assert_eq!(b.selected_name().as_deref(), Some("x.mp3"));
+        }
+    }
+
+    #[test]
+    fn a_typed_path_error_clears_on_the_next_key_after_leaving_typing() {
+        let dir = tree("errclear");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        type_path(&mut b, &dir.join("nope"));
+        b.handle_key(k(KeyCode::Enter));
+        assert!(!b.error.is_empty());
+        b.handle_key(k(KeyCode::Esc));
+        b.handle_key(ch('j'));
+        assert!(b.error.is_empty());
     }
 
     #[test]
