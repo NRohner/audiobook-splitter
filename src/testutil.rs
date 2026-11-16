@@ -61,7 +61,6 @@ pub fn cover_color(path: &Path) -> Option<&'static str> {
 }
 
 // A format tag such as "title", or "" if there is none.
-#[allow(dead_code)] // Used by the write-path tests in the next task.
 pub fn tag(path: &Path, key: &str) -> String {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", &format!("format_tags={}", key), "-of", "csv=p=0"])

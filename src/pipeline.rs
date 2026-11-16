@@ -6,10 +6,10 @@ use crate::chapters::{
     candidates, chapter_breaks, pick_breaks, plan_from_breaks, rescan_chapter, rescan_window, silence_breaks,
     transcribe_candidates, window_candidates, window_ranges, AudioFile, Break, Candidate, ChapterBreak, Segment,
 };
-use crate::meta::{tracks, Metadata, Track, DEFAULT_TEMPLATE};
+use crate::meta::{tracks, Cover, Metadata, Track, DEFAULT_TEMPLATE};
 use crate::plan::{Findings, Missing, PlanBreak, PlanSilence, Settings};
 use crate::transcribe::{find_model, Transcriber};
-use crate::{detect_silences, detect_silences_between, split_points, write_segment};
+use crate::{cover, detect_silences, detect_silences_between, split_points, write_segment};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -313,6 +313,7 @@ pub fn rescan_one(
 // Turns the breaks into chapters and names every output file, failing on a bad break or
 // an empty naming convention before anything is written.
 pub fn prepare_split(files: &[AudioFile], breaks: &[Break], meta: &Metadata) -> Result<(Vec<Segment>, Vec<Track>), String> {
+    cover::validate(&meta.cover)?;
     let segments = plan_from_breaks(files, breaks)?;
     let names = tracks(&segments, meta)?;
     Ok((segments, names))
@@ -323,12 +324,43 @@ pub struct SplitReport {
     pub failed: usize, // Each failure was also reported as a Log event.
 }
 
-// Writes one tagged file per chapter into `out_dir` (which must exist).
-pub fn write_tracks(segments: &[Segment], names: &[Track], out_dir: &Path, emit: &mut dyn FnMut(Event)) -> SplitReport {
-    emit(Event::Stage { name: "Writing files".into(), total: segments.len() });
+// Writes one tagged file per chapter into `out_dir` (which must exist), each carrying the
+// artwork `cover` picks (the embedded cover is read from `files`).
+pub fn write_tracks(
+    segments: &[Segment],
+    names: &[Track],
+    out_dir: &Path,
+    files: &[AudioFile],
+    cover: &Cover,
+    emit: &mut dyn FnMut(Event),
+) -> SplitReport {
     let mut report = SplitReport { written: Vec::new(), failed: 0 };
+    let resolved = match cover::resolve(cover, files) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            emit(Event::Log(e));
+            report.failed = segments.len();
+            return report;
+        }
+    };
+    if let Some(note) = &resolved.note {
+        emit(Event::Log(note.clone()));
+    }
+    let mut skipped: Vec<String> = segments
+        .iter()
+        .filter_map(|s| s.pieces.first()?.path.extension())
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .filter(|e| !cover::supported(e))
+        .collect();
+    skipped.sort();
+    skipped.dedup();
+    if resolved.path().is_some() && !skipped.is_empty() {
+        emit(Event::Log(format!("Cover art is only written to MP3 and M4A/M4B files; skipped for .{}.", skipped.join(", ."))));
+    }
+
+    emit(Event::Stage { name: "Writing files".into(), total: segments.len() });
     for (i, (segment, track)) in segments.iter().zip(names).enumerate() {
-        match write_segment(&segment.pieces, out_dir, track) {
+        match write_segment(&segment.pieces, out_dir, track, resolved.path()) {
             Ok(path) => {
                 emit(Event::Log(format!("Wrote {}", file_name(&path))));
                 report.written.push(path);
@@ -348,8 +380,9 @@ mod tests {
     use super::*;
     use crate::cache::Cache;
     use crate::chapters::Candidate;
-    use crate::meta::DEFAULT_TEMPLATE;
-    use crate::testutil::{temp_dir, tone_with_gaps};
+    use crate::chapters::{AudioFile, Piece, Segment};
+    use crate::meta::{Cover, DEFAULT_TEMPLATE};
+    use crate::testutil::{audio_with_cover, cover_color, image, temp_dir, tone_with_gaps};
 
     fn settings() -> Settings {
         Settings { min_silence: 1.0, noise_db: -40.0, threshold: 0.4 }
@@ -394,7 +427,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let mut ticks = 0;
-        let report = write_tracks(&segments, &names, &out, &mut |e| ticks += matches!(e, Event::Tick(_)) as usize);
+        let report = write_tracks(&segments, &names, &out, &a.files, &Cover::default(), &mut |e| ticks += matches!(e, Event::Tick(_)) as usize);
         assert_eq!((report.written.len(), report.failed, ticks), (3, 0, 3));
         let mut files: Vec<String> = report.written.iter().map(|p| file_name(p)).collect();
         files.sort();
@@ -568,5 +601,100 @@ mod tests {
         })
         .unwrap();
         assert!(!loose_logs.iter().any(|l| l.contains("from cache")));
+    }
+
+    // Two 3 s chapters of one 6 s MP3 that carries a red cover, plus a blue PNG.
+    fn covered_book(name: &str) -> (std::path::PathBuf, Vec<AudioFile>, Vec<Segment>, Vec<Track>, std::path::PathBuf) {
+        let dir = temp_dir(name);
+        let (red, blue, book) = (dir.join("red.jpg"), dir.join("blue.png"), dir.join("book.mp3"));
+        image(&red, "red");
+        image(&blue, "blue");
+        audio_with_cover(&book, 6, Some(&red));
+        let files = vec![AudioFile { path: book.clone(), silences: vec![], duration: 6.0 }];
+        let segments: Vec<Segment> = [("One", 0.0, 3.0), ("Two", 3.0, 6.0)]
+            .iter()
+            .map(|&(name, start, end)| Segment { name: name.into(), pieces: vec![Piece { path: book.clone(), start, end }] })
+            .collect();
+        let meta = Metadata { template: DEFAULT_TEMPLATE.into(), ..Default::default() };
+        let names = tracks(&segments, &meta).unwrap();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        (out, files, segments, names, blue)
+    }
+
+    fn colors(name: &str, cover: Cover) -> (Vec<Option<&'static str>>, Vec<String>) {
+        let (out, files, segments, names, _) = covered_book(name);
+        let cover = match cover {
+            Cover::File(_) => Cover::File(out.parent().unwrap().join("blue.png")),
+            other => other,
+        };
+        let mut log = Vec::new();
+        let report = write_tracks(&segments, &names, &out, &files, &cover, &mut |e| {
+            if let Event::Log(l) = e {
+                log.push(l)
+            }
+        });
+        assert_eq!((report.written.len(), report.failed), (2, 0), "{:?}", log);
+        (report.written.iter().map(|p| cover_color(p)).collect(), log)
+    }
+
+    #[test]
+    fn keep_reuses_the_source_cover_on_every_file() {
+        assert_eq!(colors("pipe-keep", Cover::Keep).0, [Some("red"), Some("red")]);
+    }
+
+    #[test]
+    fn a_chosen_image_replaces_the_source_cover() {
+        assert_eq!(colors("pipe-file", Cover::File("placeholder".into())).0, [Some("blue"), Some("blue")]);
+    }
+
+    #[test]
+    fn none_writes_files_without_artwork() {
+        assert_eq!(colors("pipe-none", Cover::None).0, [None, None]);
+    }
+
+    #[test]
+    fn keep_on_a_book_without_a_cover_still_splits() {
+        let dir = temp_dir("pipe-nocover");
+        let book = dir.join("book.mp3");
+        audio_with_cover(&book, 6, None);
+        let files = vec![AudioFile { path: book.clone(), silences: vec![], duration: 6.0 }];
+        let segments = vec![Segment { name: "One".into(), pieces: vec![Piece { path: book, start: 0.0, end: 3.0 }] }];
+        let names = tracks(&segments, &Metadata { template: DEFAULT_TEMPLATE.into(), ..Default::default() }).unwrap();
+        let report = write_tracks(&segments, &names, &dir, &files, &Cover::Keep, &mut |_| {});
+        assert_eq!((report.written.len(), report.failed), (1, 0));
+        assert_eq!(cover_color(&report.written[0]), None);
+    }
+
+    #[test]
+    fn other_containers_get_one_log_line_about_skipped_artwork() {
+        let dir = temp_dir("pipe-wav-cover");
+        let (wav, blue) = (dir.join("book.wav"), dir.join("blue.png"));
+        tone_with_gaps(&wav, 6, &[]);
+        image(&blue, "blue");
+        let files = vec![AudioFile { path: wav.clone(), silences: vec![], duration: 6.0 }];
+        let segments: Vec<Segment> = [(0.0, 3.0), (3.0, 6.0)]
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, end))| Segment { name: format!("C{}", i), pieces: vec![Piece { path: wav.clone(), start, end }] })
+            .collect();
+        let names = tracks(&segments, &Metadata { template: DEFAULT_TEMPLATE.into(), ..Default::default() }).unwrap();
+        let mut log = Vec::new();
+        let report = write_tracks(&segments, &names, &dir, &files, &Cover::File(blue), &mut |e| {
+            if let Event::Log(l) = e {
+                log.push(l)
+            }
+        });
+        assert_eq!(report.written.len(), 2);
+        assert_eq!(log.iter().filter(|l| l.contains("only written to MP3 and M4A/M4B")).count(), 1, "{:?}", log);
+    }
+
+    #[test]
+    fn a_bad_cover_fails_before_anything_is_planned() {
+        let dir = temp_dir("pipe-badcover");
+        let a = analyze(&[{ let w = dir.join("b.wav"); tone_with_gaps(&w, 6, &[(2, 3)]); w }], &settings(), None, &Cache::disabled(), &mut |_| {}).unwrap();
+        let meta = Metadata { template: DEFAULT_TEMPLATE.into(), cover: Cover::File(dir.join("nope.png")), ..Default::default() };
+        let err = prepare_split(&a.files, &a.findings.to_breaks(), &meta).unwrap_err();
+        assert!(err.contains("nope.png"), "{}", err);
     }
 }

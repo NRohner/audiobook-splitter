@@ -31,7 +31,7 @@ pub fn write_output(plan: &Plan, out: &Path) -> Result<(), String> {
     std::fs::create_dir_all(out).map_err(|e| format!("Failed to create '{}': {}", out.display(), e))?;
 
     let mut reporter = Reporter::new();
-    let report = write_tracks(&segments, &names, out, &mut |e| reporter.emit(e));
+    let report = write_tracks(&segments, &names, out, &plan.files, &plan.metadata.cover, &mut |e| reporter.emit(e));
     reporter.finish();
     println!("Wrote {} file(s) to {}.", report.written.len(), out.display());
     if report.failed > 0 {

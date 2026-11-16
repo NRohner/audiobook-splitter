@@ -370,7 +370,8 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
         return Err(format!("'{}' is not a folder.", output.display()));
     }
 
-    let (plan, names) = {
+    let cover = req.meta.cover.clone();
+    let (plan, names, files) = {
         let mut s = state.lock().unwrap();
         if s.running {
             return Err("A job is already running.".into());
@@ -387,12 +388,12 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
         s.done = 0;
         s.total = plan.len();
         s.log.push(format!("Splitting into {}", output.display()));
-        (plan, names)
+        (plan, names, s.analyzed.clone())
     };
 
     let state = state.clone();
     thread::spawn(move || {
-        pipeline::write_tracks(&plan, &names, &output, &mut |e| apply_event(&state, e));
+        pipeline::write_tracks(&plan, &names, &output, &files, &cover, &mut |e| apply_event(&state, e));
         let mut s = state.lock().unwrap();
         s.done = s.total;
         s.running = false;

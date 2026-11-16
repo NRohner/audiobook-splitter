@@ -217,7 +217,7 @@ pub fn split_file(
         }
         let out_path = out_dir.join(format!("{}_{:03}.{}", stem, index, ext));
         on_part(i + 1, points.len(), &out_path);
-        cut(input, start, duration, &[], &out_path)
+        cut(input, start, duration, &[], Art::Untouched, &out_path)
             .map_err(|e| format!("FFmpeg failed on part {}:\n{}", i + 1, e))?;
 
         start = end;
@@ -229,44 +229,77 @@ pub fn split_file(
 
 // Writes one chapter, joined from `pieces` with stream copy, to `<out_dir>/<track.name>.<ext>`
 // (never overwriting an existing file) and tags it. The pieces must share a codec.
-pub fn write_segment(pieces: &[chapters::Piece], out_dir: &Path, track: &meta::Track) -> Result<PathBuf, String> {
+// `cover` is attached to MP3 and M4A/M4B outputs; with None those outputs carry no artwork.
+pub fn write_segment(pieces: &[chapters::Piece], out_dir: &Path, track: &meta::Track, cover: Option<&Path>) -> Result<PathBuf, String> {
     let first = pieces.first().ok_or("A chapter has no audio.")?;
     let ext = first.path.extension().unwrap_or_default().to_string_lossy().to_string();
     let out_path = unique_path(out_dir, &track.name, &ext);
-    let result = match pieces {
-        [p] => cut(&p.path, p.start, p.end - p.start, &track.tags, &out_path),
-        _ => join(pieces, &track.tags, &out_path, &ext),
+    let result = if !cover::supported(&ext) {
+        match pieces {
+            [p] => cut(&p.path, p.start, p.end - p.start, &track.tags, Art::Untouched, &out_path),
+            _ => join(pieces, &track.tags, None, &out_path, &ext),
+        }
+    } else {
+        match (pieces, cover) {
+            ([p], Some(c)) => cut(&p.path, p.start, p.end - p.start, &track.tags, Art::Attach(c), &out_path),
+            ([p], None) => cut(&p.path, p.start, p.end - p.start, &track.tags, Art::Strip, &out_path),
+            _ => join(pieces, &track.tags, cover, &out_path, &ext),
+        }
     };
     result.map(|_| out_path).map_err(|e| format!("FFmpeg failed on '{}':\n{}", track.name, e))
 }
 
 // Cuts each piece to a temporary file beside `out`, then joins them in order. (The concat
 // demuxer's own `inpoint` seeks on an M4B's cover track, so it would start from 0.)
-fn join(pieces: &[chapters::Piece], tags: &[(String, String)], out: &Path, ext: &str) -> Result<(), String> {
+fn join(pieces: &[chapters::Piece], tags: &[(String, String)], cover: Option<&Path>, out: &Path, ext: &str) -> Result<(), String> {
     let parts: Vec<PathBuf> = (0..pieces.len()).map(|i| out.with_extension(format!("part{}.{}", i, ext))).collect();
     let result = pieces
         .iter()
         .zip(&parts)
-        .try_for_each(|(p, part)| cut(&p.path, p.start, p.end - p.start, &[], part))
-        .and_then(|_| concat(&parts, &pieces[0].path, tags, out));
+        .try_for_each(|(p, part)| cut(&p.path, p.start, p.end - p.start, &[], Art::Strip, part))
+        .and_then(|_| concat(&parts, &pieces[0].path, tags, cover, out));
     for part in &parts {
         let _ = std::fs::remove_file(part);
     }
     result
 }
 
+// What a cut does with cover art.
+enum Art<'a> {
+    Untouched,        // FFmpeg's defaults (the older `split_file` path, and containers without artwork).
+    Strip,            // Audio only.
+    Attach(&'a Path), // Audio plus this image as the cover.
+}
+
 // Cuts `duration` seconds of `input` from `start` into `out` with stream copy and tags it.
 // Returns FFmpeg's error output on failure.
-fn cut(input: &Path, start: f64, duration: f64, tags: &[(String, String)], out: &Path) -> Result<(), String> {
+fn cut(input: &Path, start: f64, duration: f64, tags: &[(String, String)], art: Art, out: &Path) -> Result<(), String> {
+    let (start, duration) = (start.to_string(), duration.to_string());
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
-        .arg(input)
-        .args(["-ss", &start.to_string(), "-t", &duration.to_string(), "-c", "copy"]);
-    // ponytail: drops cover art from M4B/M4A parts; the ipod muxer rejects cover
-    // tracks stored as MJPEG video. Re-attach covers with a remux if anyone misses them.
-    let ext = input.extension().unwrap_or_default().to_string_lossy().to_lowercase();
-    if ["m4b", "m4a"].contains(&ext.as_str()) {
-        cmd.arg("-vn");
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    match art {
+        Art::Attach(cover) => {
+            // The seek goes on the audio input: an output-side -ss would also skip the
+            // image's single frame, leaving a file with no cover and no error.
+            cmd.args(["-ss", &start, "-t", &duration, "-i"])
+                .arg(input)
+                .arg("-i")
+                .arg(cover)
+                .args(["-map", "0:a", "-map", "1:v", "-c", "copy", "-disposition:v:0", "attached_pic"]);
+        }
+        _ => {
+            cmd.arg("-i").arg(input).args(["-ss", &start, "-t", &duration, "-c", "copy"]);
+            if matches!(art, Art::Strip) {
+                cmd.args(["-map", "0:a"]);
+            } else {
+                // ponytail: drops cover art from M4B/M4A parts; the ipod muxer rejects cover
+                // tracks stored as MJPEG video. `write_segment` attaches covers instead.
+                let ext = input.extension().unwrap_or_default().to_string_lossy().to_lowercase();
+                if ["m4b", "m4a"].contains(&ext.as_str()) {
+                    cmd.arg("-vn");
+                }
+            }
+        }
     }
     for (key, value) in tags {
         cmd.arg("-metadata").arg(format!("{}={}", key, value));
@@ -274,8 +307,9 @@ fn cut(input: &Path, start: f64, duration: f64, tags: &[(String, String)], out: 
     finish(cmd.arg("-y").arg(out).stdin(Stdio::null()).output(), out)
 }
 
-// Joins `parts` into `out` with stream copy, keeping `source`'s tags and adding `tags`.
-fn concat(parts: &[PathBuf], source: &Path, tags: &[(String, String)], out: &Path) -> Result<(), String> {
+// Joins `parts` into `out` with stream copy, keeping `source`'s tags and adding `tags`
+// and, if given, `cover` as the artwork.
+fn concat(parts: &[PathBuf], source: &Path, tags: &[(String, String)], cover: Option<&Path>, out: &Path) -> Result<(), String> {
     // A concat demuxer list on stdin, with `file:` paths so they don't resolve against `pipe:`;
     // inside quotes only ' needs escaping, as '\''.
     let list: String = parts
@@ -287,8 +321,16 @@ fn concat(parts: &[PathBuf], source: &Path, tags: &[(String, String)], out: &Pat
         .collect();
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file,pipe", "-i", "pipe:0", "-i"])
-        .arg(source)
-        .args(["-map", "0:a", "-map_metadata", "1", "-c", "copy"]);
+        .arg(source);
+    if let Some(cover) = cover {
+        cmd.arg("-i").arg(cover).args(["-map", "0:a", "-map", "2:v"]);
+    } else {
+        cmd.args(["-map", "0:a"]);
+    }
+    cmd.args(["-map_metadata", "1", "-c", "copy"]);
+    if cover.is_some() {
+        cmd.args(["-disposition:v:0", "attached_pic"]);
+    }
     for (key, value) in tags {
         cmd.arg("-metadata").arg(format!("{}={}", key, value));
     }
@@ -328,6 +370,7 @@ pub fn unique_path(dir: &Path, name: &str, ext: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil;
     use std::fs;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -454,7 +497,7 @@ size=N/A time=00:00:10.00
             chapters::Piece { path: dir.join("book.m4b"), start: 0.0, end: 1.0 },
         ];
         let track = meta::Track { name: "joined".into(), tags: vec![] };
-        let joined = write_segment(&pieces, &out, &track).unwrap();
+        let joined = write_segment(&pieces, &out, &track, None).unwrap();
         assert!((duration(&joined) - 3.0).abs() < 0.2, "{}", duration(&joined));
     }
 
@@ -475,7 +518,7 @@ size=N/A time=00:00:10.00
         let out = dir.join("out");
         fs::create_dir(&out).unwrap();
         let one = chapters::Piece { path: mp3.clone(), start: 2.0, end: 4.0 };
-        assert_eq!(write_segment(&[one], &out, &track("01 - One", 2)), Ok(out.join("01 - One.mp3")));
+        assert_eq!(write_segment(&[one], &out, &track("01 - One", 2), None), Ok(out.join("01 - One.mp3")));
         assert!((duration(&out.join("01 - One.mp3")) - 2.0).abs() < 0.2);
 
         let probe = Command::new("ffprobe")
@@ -507,7 +550,7 @@ size=N/A time=00:00:10.00
             chapters::Piece { path: dir.join("b's.mp3"), start: 0.0, end: 3.0 },
         ];
         let track = meta::Track { name: "01 - One".into(), tags: vec![("title".into(), "01 - One".into())] };
-        let path = write_segment(&pieces, &out, &track).unwrap();
+        let path = write_segment(&pieces, &out, &track, None).unwrap();
         assert_eq!(path, out.join("01 - One.mp3"));
 
         let probe = Command::new("ffprobe")
@@ -564,5 +607,74 @@ size=N/A time=00:00:10.00
         }
         assert_eq!(next_file_index(&dir, "book (1)", "mp3").unwrap(), 8);
         assert_eq!(next_file_index(&dir.join("missing"), "book", "mp3").unwrap(), 1);
+    }
+
+    fn piece(path: &Path, start: f64, end: f64) -> chapters::Piece {
+        chapters::Piece { path: path.to_path_buf(), start, end }
+    }
+
+    fn track(name: &str) -> meta::Track {
+        meta::Track { name: name.into(), tags: vec![("title".into(), "Chapter".into())] }
+    }
+
+    // A 6 s book of each type with a red cover, plus a blue PNG to swap in.
+    fn covered_books(name: &str) -> (PathBuf, Vec<PathBuf>, PathBuf) {
+        let dir = temp_dir(name);
+        let (red, blue) = (dir.join("red.jpg"), dir.join("blue.png"));
+        testutil::image(&red, "red");
+        testutil::image(&blue, "blue");
+        let books: Vec<PathBuf> = ["mp3", "m4b"].iter().map(|ext| dir.join(format!("book.{}", ext))).collect();
+        for book in &books {
+            testutil::audio_with_cover(book, 6, Some(&red));
+        }
+        (dir, books, blue)
+    }
+
+    #[test]
+    fn write_segment_attaches_the_chosen_cover() {
+        let (dir, books, blue) = covered_books("seg-attach");
+        for book in &books {
+            let out = write_segment(&[piece(book, 1.0, 4.0)], &dir, &track("t"), Some(&blue)).unwrap();
+            assert_eq!(testutil::cover_color(&out), Some("blue"), "{}", out.display());
+            assert!((duration(&out) - 3.0).abs() < 0.15, "{} is {}s", out.display(), duration(&out));
+            assert_eq!(testutil::tag(&out, "title"), "Chapter");
+        }
+    }
+
+    #[test]
+    fn write_segment_without_a_cover_strips_the_source_one() {
+        let (dir, books, _) = covered_books("seg-strip");
+        for book in &books {
+            let out = write_segment(&[piece(book, 1.0, 4.0)], &dir, &track("t"), None).unwrap();
+            assert_eq!(testutil::cover_color(&out), None, "{}", out.display());
+            assert!((duration(&out) - 3.0).abs() < 0.15);
+        }
+    }
+
+    #[test]
+    fn a_chapter_joined_from_two_files_carries_the_cover() {
+        let (dir, books, blue) = covered_books("seg-join");
+        for book in &books {
+            let ext = book.extension().unwrap().to_string_lossy().to_string();
+            let second = dir.join(format!("second.{}", ext));
+            fs::copy(book, &second).unwrap();
+            let pieces = [piece(book, 1.0, 4.0), piece(&second, 0.0, 2.0)];
+            let with = write_segment(&pieces, &dir, &track("with"), Some(&blue)).unwrap();
+            assert_eq!(testutil::cover_color(&with), Some("blue"), "{}", with.display());
+            assert!((duration(&with) - 5.0).abs() < 0.2, "{}s", duration(&with));
+            let without = write_segment(&pieces, &dir, &track("without"), None).unwrap();
+            assert_eq!(testutil::cover_color(&without), None, "{}", without.display());
+        }
+    }
+
+    #[test]
+    fn write_segment_leaves_other_containers_alone() {
+        let dir = temp_dir("seg-wav");
+        let (wav, blue) = (dir.join("book.wav"), dir.join("blue.png"));
+        testutil::tone_with_gaps(&wav, 6, &[]);
+        testutil::image(&blue, "blue");
+        let out = write_segment(&[piece(&wav, 1.0, 4.0)], &dir, &track("t"), Some(&blue)).unwrap();
+        assert_eq!(testutil::cover_color(&out), None);
+        assert!((duration(&out) - 3.0).abs() < 0.15);
     }
 }
