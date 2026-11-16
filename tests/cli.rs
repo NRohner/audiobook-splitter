@@ -280,3 +280,16 @@ fn split_rejects_a_bad_cover_before_writing_anything() {
     bin().arg("split").arg(&plan).arg("-o").arg(&out).args(["--cover", "missing.png"]).assert().failure().stderr(contains("missing.png"));
     assert!(!out.exists(), "nothing is created when the cover is bad");
 }
+
+#[test]
+fn edit_and_run_offer_the_plain_menu_with_simple() {
+    bin().args(["edit", "--help"]).assert().success().stdout(contains("--simple"));
+    bin().args(["run", "--help"]).assert().success().stdout(contains("--simple"));
+}
+
+#[test]
+fn edit_still_needs_a_terminal_when_stdin_is_piped() {
+    let (dir, _, plan) = analyzed("edit-piped");
+    let _ = dir;
+    bin().arg("edit").arg(&plan).assert().failure().stderr(contains("interactive terminal"));
+}

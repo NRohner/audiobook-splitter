@@ -7,6 +7,9 @@ use std::path::PathBuf;
 
 #[derive(clap::Args)]
 pub struct Args {
+    /// Use the plain menu instead of the full-screen editor
+    #[arg(long)]
+    pub simple: bool,
     /// An audio file, or a folder of audio files (asked for if left out)
     pub input: Option<PathBuf>,
     /// Folder for the output files (asked for if left out)
@@ -61,7 +64,7 @@ pub fn run(mut args: Args) -> Result<(), String> {
         eprintln!("Not a terminal: splitting without review (use `edit` on the plan to review it).");
     }
     if prompt::is_terminal() && !args.yes {
-        if !edit_plan(&mut plan)? {
+        if !edit_plan(&mut plan, args.simple)? {
             println!("Stopped before splitting. The plan is saved at {}; `split` it when ready.", plan_path.display());
             return Ok(());
         }
