@@ -8,7 +8,7 @@ use ratatui::Frame;
 pub const SETUP_KEYS: &[(&str, &str)] = &[
     ("Tab, Shift-Tab, Up, Down", "move between the fields"),
     ("Enter", "browse for a path (on the first three rows)"),
-    ("Space, Left, Right", "turn the cache on or off"),
+    ("Space, Left, Right, Enter", "turn the cache on or off"),
     ("Ctrl-U", "clear the field"),
     ("Ctrl-A", "start the analysis"),
     ("Esc, Ctrl-c", "quit"),

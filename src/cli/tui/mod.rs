@@ -190,11 +190,13 @@ impl App {
                     editor.set_status(n);
                 }
                 self.confirm_quit = false;
+                self.help = false;
                 self.screen = Screen::Editor(Box::new(editor));
             }
             Some(Finished::Analysis(Err(e))) => {
                 self.setup.error = e;
                 self.confirm_quit = false;
+                self.help = false;
                 self.screen = Screen::Setup;
             }
             Some(Finished::Split(result)) => {
@@ -209,6 +211,7 @@ impl App {
                     Err(e) => DoneInfo { written: 0, failed: 0, out, plan_path, error: Some(e), plan_error, log },
                 };
                 self.confirm_quit = false;
+                self.help = false;
                 self.screen = Screen::Done(info);
             }
             None => {}
@@ -716,6 +719,24 @@ mod tests {
         assert!(matches!(app.screen, Screen::Setup));
         app.handle_key(ch('y'));
         assert!(!app.is_over());
+    }
+
+    #[test]
+    fn a_job_finishing_closes_the_help_popup() {
+        let mut app = App::new(None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        app.handle_key(ch('?'));
+        assert!(app.help);
+        assert!(draw(&mut app, 100, 24).contains("Keys"), "the popup is drawn");
+        tx.send(jobs::Msg::Done(Err("nope".into()))).unwrap();
+        app.tick();
+        assert!(!app.help);
+        assert!(matches!(app.screen, Screen::Setup));
+        app.handle_key(ch('z'));
+        app.handle_key(ch('q'));
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen.contains("zq"), "the next key is not swallowed:\n{}", screen);
     }
 
     #[test]
