@@ -20,6 +20,8 @@ A Rust application (local web GUI plus a full command-line interface that works 
 
 * **Chapter Editor (GUI):** After analysis, rename, remove or add chapters, move a break to the previous or next silence, add one at any time (`h:mm:ss`), or promote a silence the analysis skipped. Every break can be played back to check it by ear. Also available in the CLI as `edit`.
 
+* **Terminal app (TUI):** `cargo run -- tui` (or the release binary's `tui` command) is a full-screen version of the whole workflow: choose the book with a built-in file browser, set the analysis options, watch the progress, edit chapters, tags and cover art, and split. It works over SSH and in tmux and needs a terminal of at least 60x15.
+
 * **Metadata Editor (GUI):** Set the album, artist, album artist, genre and year for the whole book, and a track naming convention such as `{n} - {title}` (`{n}` counts from 00; `{album}` is also available). Every output file is tagged disc 1 with sequential track numbers across the whole book. Empty fields keep the source file's tags. Cover art: keep the cover already embedded in the source (the default), attach a JPEG or PNG, or write none. It is written to every MP3 and M4A/M4B output.
 
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
@@ -151,10 +153,11 @@ The CLI does everything the GUI does, step by step, joined by a plan file. It wo
 |---|---|
 | `analyze <input>` | Detect silences (and match EPUB chapters with `--epub`), write `plan.json` |
 | `rescan <plan>` | Look again for chapters the EPUB match missed (`--chapter N` for one) |
-| `edit <plan>` | Interactive menu: rename, remove, add or move chapters, edit tags and file naming |
+| `edit <plan>` | Full-screen chapter editor: table of chapters, what Whisper heard around each break, single-key actions with undo/redo, tags and cover form. `--simple` gives the plain prompt menu instead |
 | `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
 | `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, `--cover keep\|none\|PATH`, ...) |
-| `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
+| `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor, `--simple` uses the plain prompt menu instead of the full-screen editor) |
+| `tui [PATH]` | Full-screen app for the whole workflow. `PATH` may be an audio file or folder (starts at Setup) or a plan file (opens the editor) |
 | `cache info` / `cache clear [path ...]` | Show or empty the cache of silences and transcripts (see below) |
 | `gui` | Start the web GUI |
 
@@ -167,6 +170,36 @@ audiobook-splitter-rust split mybook.plan.json -o ~/books/mybook-split
 ```
 
 Transcription is the slow step; the plan file means you do it once and can edit and split later (run it in `tmux` so a dropped connection doesn't lose it). A plan records the audio files it was made from and is rejected if they change. `run` with no arguments (or the old `--cli` flag) asks for the input, output and an optional EPUB. Running the binary with no arguments prints the help; the GUI needs `gui`.
+
+### Terminal app
+
+`tui` walks through Setup, Analyze, Editor, Split and Done in one full-screen app. Give it an audio file or folder to start at Setup with the input filled in, or a `plan.json` to open the editor directly (it asks for the output folder before splitting). After analysis the plan is saved as `<output>/plan.json`. `b` in the editor goes back to Setup; on Done, `n` starts another book and `q` quits.
+
+It needs a real terminal of at least 60x15 with `TERM` set, and has no menu fallback. `edit` and `run` use the same editor and fall back to the plain menu with `--simple`, on a dumb or too-small terminal, when stdin or stdout is not a terminal, or if the terminal can't be set up. Not included: mouse support, playback, and cancelling a running job.
+
+Editor keys (`?` shows them in the app):
+
+| Key | Action |
+|---|---|
+| Up/Down, `j`/`k`, PgUp/PgDn, Home/End | Move the selection |
+| Enter, `r` | Rename the chapter |
+| `[` `]` | Move the break to the previous or next silence |
+| `d` | Remove the chapter |
+| `a` | Add a chapter at a time |
+| `n` | Add a chapter at a silence |
+| `m` | Chapters the EPUB match missed |
+| `t` | Tags, file naming and cover art |
+| `g` | Jump to a time (`1:02:03`) or a chapter number |
+| `p` | Write a preview clip of the selected break |
+| `u`, Ctrl-r | Undo, redo |
+| `s` | Save |
+| `q`, Ctrl-c | Quit (asks if there are unsaved changes) |
+| `b` | Back to Setup (`tui` only) |
+| `?` | Help |
+
+Cover art is chosen in the tags form: keep the embedded cover, use none, or use an image (Ctrl-B on the image row opens the file browser for a JPEG or PNG).
+
+File browser keys: Enter opens a folder or picks a file, Space picks the current folder (where a folder is wanted), Backspace goes up, `/` filters the list, `.` shows or hides hidden files, Tab types a path, `~` jumps to the home folder, Esc cancels.
 
 ### Resuming and the cache
 

@@ -34,6 +34,7 @@ impl<T: Send + 'static> Job<T> {
 }
 
 impl<T> Job<T> {
+    #[cfg(test)]
     pub fn from_receiver(rx: Receiver<Msg<T>>) -> Job<T> {
         Job { rx }
     }

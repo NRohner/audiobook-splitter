@@ -17,6 +17,7 @@ impl Input {
         self.text.iter().collect()
     }
 
+    #[cfg(test)]
     pub fn cursor(&self) -> usize {
         self.cursor
     }
