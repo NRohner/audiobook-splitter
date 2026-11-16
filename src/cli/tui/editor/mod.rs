@@ -3,6 +3,7 @@
 // tests drive them with synthetic keys and ratatui's TestBackend. Every change goes through
 // `apply`, which snapshots first so undo/redo and refusals are uniform.
 mod view;
+pub(crate) use view::centered;
 
 use super::input::Input;
 use super::tags::{FormOutcome, TagsForm};
