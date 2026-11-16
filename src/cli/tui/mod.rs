@@ -20,7 +20,7 @@ use jobs::{Job, Msg};
 use progress::Progress;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use setup::{AnalyzeRequest, Setup, SetupOutcome};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,8 @@ struct DoneInfo {
     out: PathBuf,
     plan_path: Option<PathBuf>,
     error: Option<String>,
+    plan_error: Option<String>,
+    log: Vec<String>,
 }
 
 enum Screen {
@@ -63,6 +65,8 @@ pub struct App {
     plan_path: Option<PathBuf>,
     confirm_quit: bool,
     quit: bool,
+    // Why the plan could not be saved when the split started; shown on the Done screen.
+    plan_error: Option<String>,
 }
 
 fn is_plan_path(path: &Path) -> bool {
@@ -91,6 +95,7 @@ impl App {
                 plan_path: None,
                 confirm_quit: false,
                 quit: false,
+                plan_error: None,
             }),
         }
     }
@@ -99,7 +104,7 @@ impl App {
     pub fn with_plan(plan: Plan, plan_path: Option<PathBuf>) -> App {
         let mut editor = Editor::new(plan);
         editor.allow_back = true;
-        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, quit: false }
+        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, quit: false, plan_error: None }
     }
 
     pub fn is_over(&self) -> bool {
@@ -148,9 +153,10 @@ impl App {
                 return;
             }
         };
+        self.plan_error = None;
         if let Some(path) = &self.plan_path {
             if let Err(e) = plan.save(path) {
-                editor.set_status(format!("Couldn't save the plan: {}", e));
+                self.plan_error = Some(e.to_string());
             }
         }
         self.out = Some(out.clone());
@@ -180,18 +186,26 @@ impl App {
                 if let Some(n) = notice {
                     editor.set_status(n);
                 }
+                self.confirm_quit = false;
                 self.screen = Screen::Editor(Box::new(editor));
             }
             Some(Finished::Analysis(Err(e))) => {
                 self.setup.error = e;
+                self.confirm_quit = false;
                 self.screen = Screen::Setup;
             }
             Some(Finished::Split(result)) => {
                 let out = self.out.clone().unwrap_or_default();
-                let info = match result {
-                    Ok(report) => DoneInfo { written: report.written.len(), failed: report.failed, out, plan_path: self.plan_path.clone(), error: None },
-                    Err(e) => DoneInfo { written: 0, failed: 0, out, plan_path: self.plan_path.clone(), error: Some(e) },
+                let log = match &self.screen {
+                    Screen::Splitting { progress, .. } => progress.tail(8),
+                    _ => Vec::new(),
                 };
+                let (plan_path, plan_error) = (self.plan_path.clone(), self.plan_error.take());
+                let info = match result {
+                    Ok(report) => DoneInfo { written: report.written.len(), failed: report.failed, out, plan_path, error: None, plan_error, log },
+                    Err(e) => DoneInfo { written: 0, failed: 0, out, plan_path, error: Some(e), plan_error, log },
+                };
+                self.confirm_quit = false;
                 self.screen = Screen::Done(info);
             }
             None => {}
@@ -279,16 +293,26 @@ fn render_done(f: &mut Frame, area: Rect, info: &DoneInfo) {
         None => {
             lines.push(Line::raw(format!("Wrote {} file(s) to {}.", info.written, info.out.display())));
             if info.failed > 0 {
-                lines.push(Line::raw(format!("{} file(s) could not be written; see the log lines above on the last screen or run `split` on the plan.", info.failed)));
+                let retry = match &info.plan_path {
+                    Some(p) if info.plan_error.is_none() => format!("split {}", p.display()),
+                    _ => "split".to_string(),
+                };
+                lines.push(Line::raw(format!("{} file(s) could not be written; the log is below. You can retry with `{}`.", info.failed, retry)));
             }
         }
     }
-    if let Some(p) = &info.plan_path {
-        lines.push(Line::raw(format!("The plan is saved at {}.", p.display())));
+    match (&info.plan_error, &info.plan_path) {
+        (Some(e), _) => lines.push(Line::raw(format!("The plan could not be saved: {}", e))),
+        (None, Some(p)) => lines.push(Line::raw(format!("The plan is saved at {}.", p.display()))),
+        (None, None) => {}
     }
     lines.push(Line::raw(""));
     lines.push(Line::raw("n  another book    q or Enter  quit"));
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Done ")), area);
+    if info.failed > 0 || info.error.is_some() {
+        lines.push(Line::raw(""));
+        lines.extend(info.log.iter().map(|l| Line::raw(l.as_str())));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(" Done ")), area);
 }
 
 // `tui`: the full-screen app, from choosing the book to splitting it.
@@ -550,6 +574,96 @@ mod tests {
         std::fs::write(&bad, "not a plan").unwrap();
         assert!(App::new(Some(bad.as_path())).is_err());
         assert!(App::new(Some(dir.join("missing.json").as_path())).is_err());
+    }
+
+    fn done_with(failed: usize, error: Option<String>, plan_error: Option<String>) -> DoneInfo {
+        DoneInfo {
+            written: 1,
+            failed,
+            out: PathBuf::from("/tmp/out"),
+            plan_path: Some(PathBuf::from("/tmp/out/plan.json")),
+            error,
+            plan_error,
+            log: vec!["first".into(), "boom line".into()],
+        }
+    }
+
+    #[test]
+    fn done_with_failures_shows_the_count_the_retry_hint_and_the_log() {
+        let mut app = App::new(None).unwrap();
+        app.screen = Screen::Done(done_with(2, None, None));
+        let screen = draw(&mut app, 120, 24);
+        assert!(screen.contains("2 file(s) could not be written"), "{}", screen);
+        assert!(screen.contains("split /tmp/out/plan.json"), "{}", screen);
+        assert!(screen.contains("boom line"), "{}", screen);
+        for (w, h) in [(60, 15), (40, 8)] {
+            draw(&mut app, w, h);
+        }
+        app.screen = Screen::Done(done_with(0, Some("ffmpeg died".into()), None));
+        let screen = draw(&mut app, 80, 24);
+        assert!(screen.contains("ffmpeg died") && screen.contains("boom line"), "{}", screen);
+        for (w, h) in [(60, 15), (40, 8)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn a_plan_that_could_not_be_saved_is_reported_on_the_done_screen() {
+        let (dir, wav) = book("plansave");
+        let out = dir.join("out");
+        let mut app = App::new(Some(wav.as_path())).unwrap();
+        app.start_analysis(request(&wav, &out)).unwrap();
+        wait(&mut app, "the analysis", in_editor);
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "a file").unwrap();
+        app.plan_path = Some(blocker.join("plan.json"));
+        app.handle_key(ch('s'));
+        wait(&mut app, "the split", |a| matches!(a.screen, Screen::Done(_)));
+        let Screen::Done(info) = &app.screen else { unreachable!() };
+        assert_eq!((info.written, info.failed), (3, 0));
+        let screen = draw(&mut app, 100, 24);
+        assert!(screen.contains("could not be saved"), "{}", screen);
+        assert!(!screen.contains("The plan is saved"), "{}", screen);
+    }
+
+    #[test]
+    fn a_job_finishing_closes_the_quit_prompt() {
+        let mut app = App::new(None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.confirm_quit);
+        tx.send(jobs::Msg::Done(Err("nope".into()))).unwrap();
+        app.tick();
+        assert!(!app.confirm_quit);
+        assert!(matches!(app.screen, Screen::Setup));
+        app.handle_key(ch('y'));
+        assert!(!app.is_over());
+    }
+
+    #[test]
+    fn a_rename_in_a_plan_opened_directly_is_saved_back_to_that_plan() {
+        let (dir, wav) = book("rename");
+        let mut first = App::new(Some(wav.as_path())).unwrap();
+        first.start_analysis(request(&wav, &dir.join("analysis"))).unwrap();
+        wait(&mut first, "the analysis", in_editor);
+        let plan_path = dir.join("analysis").join("plan.json");
+        let mut app = App::new(Some(plan_path.as_path())).unwrap();
+        app.handle_key(ch('r'));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "Renamed".chars() {
+            app.handle_key(ch(c));
+        }
+        app.handle_key(k(KeyCode::Enter));
+        let out = dir.join("chosen");
+        std::fs::create_dir_all(&out).unwrap();
+        app.handle_key(ch('s'));
+        let Screen::PickOutput { browser, .. } = &mut app.screen else { panic!("expected the output picker") };
+        *browser = browser::Browser::new("Choose the output folder", out.to_str().unwrap(), browser::Pick::Folder);
+        app.handle_key(ch(' '));
+        wait(&mut app, "the split", |a| matches!(a.screen, Screen::Done(_)));
+        let saved = Plan::load(&plan_path).unwrap();
+        assert!(saved.findings.breaks.iter().any(|b| b.title == "Renamed"), "{:?}", saved.findings.breaks.iter().map(|b| &b.title).collect::<Vec<_>>());
     }
 
     #[test]

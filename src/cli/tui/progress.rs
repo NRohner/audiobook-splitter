@@ -40,6 +40,11 @@ impl Progress {
         }
     }
 
+    // The last `n` log lines, oldest first.
+    pub fn tail(&self, n: usize) -> Vec<String> {
+        self.log[self.log.len().saturating_sub(n)..].to_vec()
+    }
+
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let block = Block::bordered().title(format!(" {} ", self.title));
         let inner = block.inner(area);
