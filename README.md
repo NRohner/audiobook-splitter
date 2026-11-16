@@ -20,7 +20,7 @@ A Rust application (local web GUI plus a full command-line interface that works 
 
 * **Chapter Editor (GUI):** After analysis, rename, remove or add chapters, move a break to the previous or next silence, add one at any time (`h:mm:ss`), or promote a silence the analysis skipped. Every break can be played back to check it by ear. Also available in the CLI as `edit`.
 
-* **Metadata Editor (GUI):** Set the album, artist, album artist, genre and year for the whole book, and a track naming convention such as `{n} - {title}` (`{n}` counts from 00; `{album}` is also available). Every output file is tagged disc 1 with sequential track numbers across the whole book. Empty fields keep the source file's tags.
+* **Metadata Editor (GUI):** Set the album, artist, album artist, genre and year for the whole book, and a track naming convention such as `{n} - {title}` (`{n}` counts from 00; `{album}` is also available). Every output file is tagged disc 1 with sequential track numbers across the whole book. Empty fields keep the source file's tags. Cover art: keep the cover already embedded in the source (the default), attach a JPEG or PNG, or write none. It is written to every MP3 and M4A/M4B output.
 
 * **Multi-file Processing:** Option to process multiple audio files consecutively.
 
@@ -153,7 +153,7 @@ The CLI does everything the GUI does, step by step, joined by a plan file. It wo
 | `rescan <plan>` | Look again for chapters the EPUB match missed (`--chapter N` for one) |
 | `edit <plan>` | Interactive menu: rename, remove, add or move chapters, edit tags and file naming |
 | `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
-| `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, ...) |
+| `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, `--cover keep|none|PATH`, ...) |
 | `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
 | `cache info` / `cache clear [path ...]` | Show or empty the cache of silences and transcripts (see below) |
 | `gui` | Start the web GUI |
