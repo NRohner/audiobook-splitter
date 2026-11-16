@@ -43,6 +43,9 @@
   input { flex: 1; min-width: 0; width: 100%; padding: 9px 11px; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 7px; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .hint { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .choice { display: flex; align-items: center; gap: 8px; font-weight: 400; margin-bottom: 6px; }
+  .choice input { flex: none; width: auto; padding: 0; margin: 0; }
+  #cover-thumb { display: block; width: 96px; height: 96px; object-fit: cover; border-radius: 7px; border: 1px solid var(--border); margin-top: 8px; }
   button { display: inline-flex; align-items: center; gap: 6px; padding: 9px 14px; font: inherit; font-weight: 600; border-radius: 7px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; white-space: nowrap; }
   button:hover:not(:disabled) { border-color: var(--muted); }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
@@ -199,6 +202,19 @@
       <div class="hint">Sets each file's name and title tag. <code>{n}</code> is the track number from 00, <code>{title}</code> the chapter, <code>{album}</code> the album.</div>
       <div id="name-preview" class="preview"></div>
     </div>
+    <div class="field">
+      <label id="cover-label">Cover art</label>
+      <div role="radiogroup" aria-labelledby="cover-label">
+        <label class="choice"><input type="radio" name="cover" value="keep" checked>Keep the embedded cover <span id="cover-source" class="hint"></span></label>
+        <label class="choice"><input type="radio" name="cover" value="none">No cover art</label>
+        <label class="choice"><input type="radio" name="cover" value="file">Use an image
+          <button type="button" id="cover-pick"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>Choose image</button>
+        </label>
+      </div>
+      <img id="cover-thumb" alt="Chosen cover art" hidden>
+      <div id="cover-path" class="hint"></div>
+      <div class="hint">JPEG or PNG. Written to MP3 and M4A/M4B files.</div>
+    </div>
   </section>
 
   <div class="actions">
@@ -261,12 +277,32 @@ $('analyze').addEventListener('click', async () => {
 
 $('split').addEventListener('click', async () => {
   showError(null, 'split-error');
-  const meta = { template: $('template').value };
+  const meta = { template: $('template').value, cover: coverChoice() };
   for (const f of metaFields) meta[f] = $('m_' + f).value;
+  if (meta.cover.file === null) { showError(new Error('Choose an image file for the cover first.'), 'split-error'); return; }
   try {
     await api('/split', { output: $('output').value, breaks: draft.map(({ file, at, title }) => ({ file, at, title })), meta });
     poll();
   } catch (e) { showError(e, 'split-error'); }
+});
+
+let coverFile = null; // Path picked with "Choose image".
+const coverChoice = () => {
+  const v = document.querySelector('input[name=cover]:checked').value;
+  return v === 'file' ? { file: coverFile } : v;
+};
+$('cover-pick').addEventListener('click', async (e) => {
+  e.preventDefault(); // The button sits inside a label; don't also toggle the radio twice.
+  showError(null, 'split-error');
+  try {
+    const { path, thumb } = await api('/browse', { kind: 'image' });
+    if (!path) return;
+    coverFile = path;
+    $('cover-path').textContent = path;
+    $('cover-thumb').hidden = !thumb;
+    if (thumb) $('cover-thumb').src = thumb;
+    document.querySelector('input[name=cover][value=file]').checked = true;
+  } catch (err) { showError(err, 'split-error'); }
 });
 
 // One shared player; `playing` is the "file:at" key being played, or null.
@@ -343,6 +379,7 @@ function loadEditor(s) {
   silences = s.silences;
   audio = s.audio;
   for (const f of metaFields) $('m_' + f).value = s.meta[f];
+  $('cover-source').textContent = s.cover_source ? '(' + s.cover_source + ')' : '(none found)';
   if (!$('template').value.trim()) $('template').value = s.meta.template;
   $('add-file').replaceChildren(...audio.map((a, i) => new Option(a.name, i)));
   $('add-file').hidden = audio.length < 2;

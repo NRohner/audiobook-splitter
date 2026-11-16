@@ -1,8 +1,19 @@
 // Per-book tags and track naming: every output file is one track of disc 1.
 use crate::chapters::{sanitize_file_name, Segment};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const DEFAULT_TEMPLATE: &str = "{n} - {title}";
+
+// Where every output file's album artwork comes from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cover {
+    #[default]
+    Keep, // The cover embedded in the source file(s), if there is one.
+    None,
+    File(PathBuf), // A JPEG or PNG the user chose.
+}
 
 // Empty fields keep whatever tag the source file had.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -14,6 +25,7 @@ pub struct Metadata {
     pub genre: String,
     pub year: String,
     pub template: String, // File name and title, with {n}, {title} and {album}.
+    pub cover: Cover,
 }
 
 // One output file: its name (without extension) and the tags to write.
@@ -101,5 +113,21 @@ mod tests {
     #[test]
     fn empty_template_is_an_error() {
         assert!(tracks(&plan(&["a"]), &meta("  ")).is_err());
+    }
+
+    #[test]
+    fn cover_serializes_as_keep_none_or_file() {
+        assert_eq!(serde_json::to_string(&Cover::Keep).unwrap(), r#""keep""#);
+        assert_eq!(serde_json::to_string(&Cover::None).unwrap(), r#""none""#);
+        assert_eq!(serde_json::to_string(&Cover::File("a.png".into())).unwrap(), r#"{"file":"a.png"}"#);
+        let back: Cover = serde_json::from_str(r#"{"file":"a.png"}"#).unwrap();
+        assert_eq!(back, Cover::File("a.png".into()));
+    }
+
+    #[test]
+    fn metadata_without_a_cover_field_keeps_the_embedded_cover() {
+        let m: Metadata = serde_json::from_str(r#"{"album":"A"}"#).unwrap();
+        assert_eq!(m.cover, Cover::Keep);
+        assert_eq!(Metadata::default().cover, Cover::Keep);
     }
 }

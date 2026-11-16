@@ -15,6 +15,7 @@ pub const CLIP_SECONDS: f64 = 20.0;
 // Silences this close to a file's start/end are covered by the file boundary itself.
 const EDGE_SECONDS: f64 = 1.0;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFile {
     pub path: PathBuf,
     pub silences: Vec<Silence>,
@@ -35,13 +36,16 @@ impl Candidate {
     }
 }
 
-#[derive(Debug, Clone)]
+// The text fields are only for display (the GUI polls them), so the plan file leaves them out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChapterBreak {
     pub file: usize,
     pub at: f64,
     pub chapter: usize,
     pub score: f64,
+    #[serde(skip)]
     pub before: String,
+    #[serde(skip)]
     pub after: String,
 }
 
