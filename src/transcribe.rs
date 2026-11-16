@@ -1,10 +1,11 @@
-// Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows).
+// Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows and Linux).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
 
 pub const MODEL_FILE: &str = "ggml-base.en.bin";
+const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
 
 // `$WHISPER_MODEL`, else models/<MODEL_FILE> in the working directory or the repo
 // the binary was built in (target/{debug,release}/../../models).
@@ -24,6 +25,45 @@ pub fn find_model() -> Result<PathBuf, String> {
         .map(|dir| dir.join(MODEL_FILE))
         .find(|p| p.is_file())
         .ok_or_else(|| format!("Whisper model '{}' not found. Download it into models/ (`make model`, or see the README on Windows).", MODEL_FILE))
+}
+
+// Like `find_model`, but downloads the default model with curl (on every supported OS)
+// when it isn't there yet. A `$WHISPER_MODEL` path is the user's choice and never fetched.
+pub fn ensure_model() -> Result<PathBuf, String> {
+    let missing = match find_model() {
+        Ok(path) => return Ok(path),
+        Err(e) if std::env::var_os("WHISPER_MODEL").is_some() => return Err(e),
+        Err(e) => e,
+    };
+    let dir = download_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{} Could not create '{}': {}", missing, dir.display(), e))?;
+    let target = dir.join(MODEL_FILE);
+    let partial = dir.join(format!("{}.part", MODEL_FILE));
+    // Silent so it can't scribble over the terminal UI; -f turns HTTP errors into failures.
+    let output = Command::new("curl")
+        .args(["-L", "-f", "-sS", "-o"])
+        .arg(&partial)
+        .arg(MODEL_URL)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("{} Automatic download needs curl, which failed to run: {}", missing, e))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("{} Downloading it failed: {}", missing, String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    std::fs::rename(&partial, &target).map_err(|e| format!("Could not save the model to '{}': {}", target.display(), e))?;
+    Ok(target)
+}
+
+// models/ in the repo the binary was built in (target/{debug,release}/../../models), so
+// the download lands where `make model` puts it; otherwise models/ in the working directory.
+fn download_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("../..")))
+        .filter(|root| root.join("Cargo.toml").is_file())
+        .map(|root| root.join("models"))
+        .unwrap_or_else(|| PathBuf::from("models"))
 }
 
 // On an M3 Pro (Metal), 3 transcribed a book 8% faster than 2 (39 s vs 42 s; one at a time took 78 s).
@@ -138,6 +178,15 @@ mod tests {
             text.replace('\'', "''")
         );
         assert!(Command::new("powershell").args(["-NoProfile", "-Command", &script]).status().unwrap().success());
+        wav
+    }
+
+    // Linux has no built-in speech engine: this needs espeak-ng (`apt install espeak-ng`).
+    #[cfg(target_os = "linux")]
+    fn speak(text: &str) -> PathBuf {
+        let wav = std::env::temp_dir().join(format!("abs-say-{}-{}.wav", std::process::id(), text.len()));
+        let status = Command::new("espeak-ng").arg("-w").arg(&wav).arg(text).status();
+        assert!(status.is_ok_and(|s| s.success()), "espeak-ng is needed for this test (apt install espeak-ng)");
         wav
     }
 

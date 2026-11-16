@@ -8,7 +8,7 @@ use crate::chapters::{
 };
 use crate::meta::{tracks, Cover, Metadata, Track, DEFAULT_TEMPLATE};
 use crate::plan::{Findings, Missing, PlanBreak, PlanSilence, Settings};
-use crate::transcribe::{find_model, Transcriber};
+use crate::transcribe::{ensure_model, Transcriber};
 use crate::{cover, detect_silences, detect_silences_between, split_points, write_segment};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,11 +108,11 @@ pub struct EpubInput {
     pub model: PathBuf,
 }
 
-// Reads the EPUB and finds the Whisper model, so a bad EPUB or missing model fails
-// before any slow work starts. Also returns (album, artist, year) from the EPUB.
+// Reads the EPUB and finds (downloading it first if needed) the Whisper model, so a bad
+// EPUB or failed download happens before any slow work starts. Also returns (album, artist, year) from the EPUB.
 pub fn open_epub(path: &Path) -> Result<(EpubInput, (String, String, String)), String> {
     let chapters = load_chapters(path)?;
-    let model = find_model()?;
+    let model = ensure_model()?;
     let info = book_info(path)?;
     Ok((EpubInput { path: path.to_path_buf(), chapters, model }, info))
 }
