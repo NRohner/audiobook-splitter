@@ -16,7 +16,8 @@ pub struct Job<T> {
 impl<T: Send + 'static> Job<T> {
     pub fn spawn(work: impl FnOnce(&mut dyn FnMut(Event)) -> Result<T, String> + Send + 'static) -> Job<T> {
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
+        let fail_tx = tx.clone();
+        let spawned = thread::Builder::new().name("tui-job".into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 work(&mut |e| {
                     let _ = tx.send(Msg::Event(e));
@@ -25,6 +26,9 @@ impl<T: Send + 'static> Job<T> {
             .unwrap_or_else(|_| Err("The background job crashed.".to_string()));
             let _ = tx.send(Msg::Done(result));
         });
+        if let Err(e) = spawned {
+            let _ = fail_tx.send(Msg::Done(Err(format!("Couldn't start the background job: {}", e))));
+        }
         Job { rx }
     }
 }
@@ -79,6 +83,24 @@ mod tests {
     fn a_panicking_job_becomes_an_error_instead_of_hanging_the_screen() {
         let job: Job<u32> = Job::spawn(|_| panic!("boom"));
         assert!(drain(&job).1.unwrap_err().contains("crashed"));
+    }
+
+    #[test]
+    fn a_job_runs_on_a_thread_named_tui_job() {
+        let job: Job<String> = Job::spawn(|_| Ok(std::thread::current().name().map(String::from).unwrap_or_default()));
+        assert_eq!(drain_any(&job), Ok("tui-job".to_string()));
+    }
+
+    fn drain_any<T>(job: &Job<T>) -> Result<T, String> {
+        for _ in 0..500 {
+            while let Some(msg) = job.try_next() {
+                if let Msg::Done(r) = msg {
+                    return r;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the job never finished");
     }
 
     #[test]

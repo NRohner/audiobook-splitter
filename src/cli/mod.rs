@@ -51,6 +51,8 @@ enum Cmd {
     Run(run::Args),
     /// Show or empty the cache of silences and transcripts
     Cache(cache::Args),
+    /// Full-screen terminal app: choose a book, analyze, edit chapters and tags, split
+    Tui(tui::Args),
     /// Start the web GUI
     Gui,
 }
@@ -178,6 +180,7 @@ pub fn run(mut args: Vec<String>) {
         Cmd::Preview(a) => preview::run(a),
         Cmd::Run(a) => run::run(a),
         Cmd::Cache(a) => cache::run(a),
+        Cmd::Tui(a) => tui::run(a),
         Cmd::Gui => {
             crate::gui::run();
             Ok(())

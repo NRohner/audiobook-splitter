@@ -10,8 +10,317 @@ pub mod terminal;
 
 use audiobook_splitter_rust::plan::Plan;
 use editor::{Editor, Outcome};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use terminal::TerminalGuard;
+use super::{check_tools, open_cache, open_plan};
+use audiobook_splitter_rust::pipeline::{self, analyze, default_metadata, file_name, open_epub, prepare_split, write_tracks, SplitReport};
+use audiobook_splitter_rust::user_path;
+use browser::{Browser, BrowserOutcome, Pick};
+use jobs::{Job, Msg};
+use progress::Progress;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::Frame;
+use setup::{AnalyzeRequest, Setup, SetupOutcome};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(clap::Args)]
+pub struct Args {
+    /// An audio file or folder to start with, or a plan file made by `analyze` to edit
+    pub path: Option<PathBuf>,
+}
+
+struct DoneInfo {
+    written: usize,
+    failed: usize,
+    out: PathBuf,
+    plan_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+enum Screen {
+    Setup,
+    Analyzing { progress: Progress, job: Job<Plan> },
+    Editor(Box<Editor>),
+    PickOutput { editor: Box<Editor>, browser: Browser },
+    Splitting { progress: Progress, job: Job<SplitReport> },
+    Done(DoneInfo),
+}
+
+enum Finished {
+    Analysis(Result<Plan, String>),
+    Split(Result<SplitReport, String>),
+}
+
+// The whole terminal app: one screen at a time, the Setup form kept across screens so `b`
+// (back) finds what the user typed.
+pub struct App {
+    screen: Screen,
+    setup: Setup,
+    out: Option<PathBuf>,
+    plan_path: Option<PathBuf>,
+    confirm_quit: bool,
+    quit: bool,
+}
+
+fn is_plan_path(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
+
+// Everything a running job has sent so far; the job's result if it has finished.
+fn drain<T>(job: &Job<T>, progress: &mut Progress) -> Option<Result<T, String>> {
+    while let Some(msg) = job.try_next() {
+        match msg {
+            Msg::Event(e) => progress.apply(e),
+            Msg::Done(r) => return Some(r),
+        }
+    }
+    None
+}
+
+impl App {
+    pub fn new(arg: Option<&Path>) -> Result<App, String> {
+        match arg {
+            Some(path) if is_plan_path(path) => Ok(App::with_plan(open_plan(path)?, Some(path.to_path_buf()))),
+            other => Ok(App {
+                screen: Screen::Setup,
+                setup: Setup::new(other.map(|p| p.display().to_string()).as_deref()),
+                out: None,
+                plan_path: None,
+                confirm_quit: false,
+                quit: false,
+            }),
+        }
+    }
+
+    // An app that starts in the editor on an existing plan.
+    pub fn with_plan(plan: Plan, plan_path: Option<PathBuf>) -> App {
+        let mut editor = Editor::new(plan);
+        editor.allow_back = true;
+        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, quit: false }
+    }
+
+    pub fn is_over(&self) -> bool {
+        self.quit
+    }
+
+    // Fails fast (bad EPUB, missing tools) before any slow work starts, then runs the analysis
+    // on a worker thread and shows its progress.
+    fn start_analysis(&mut self, req: AnalyzeRequest) -> Result<(), String> {
+        check_tools()?;
+        let (epub, meta) = match &req.epub {
+            Some(path) => {
+                let (epub, info) = open_epub(path)?;
+                (Some(epub), default_metadata(Some(info)))
+            }
+            None => (None, default_metadata(None)),
+        };
+        let cache = open_cache(!req.use_cache);
+        let AnalyzeRequest { inputs, epub: epub_path, out, settings, .. } = req;
+        self.plan_path = Some(out.join("plan.json"));
+        self.out = Some(out);
+        let job = Job::spawn(move |emit| {
+            let analysis = analyze(&inputs, &settings, epub.as_ref(), &cache, emit)?;
+            for (i, why) in &analysis.errors {
+                emit(pipeline::Event::Log(format!("Skipped {}: {}", file_name(&inputs[*i]), why)));
+            }
+            if analysis.files.is_empty() {
+                return Err("None of the audio files could be analyzed.".to_string());
+            }
+            Ok(Plan::new(analysis.files, settings, epub_path, analysis.findings, meta))
+        });
+        self.screen = Screen::Analyzing { progress: Progress::new("Analyzing"), job };
+        Ok(())
+    }
+
+    // Validates the split before anything is written, saves the plan, then writes the files on a worker thread.
+    fn start_split(&mut self, mut editor: Box<Editor>, out: PathBuf) {
+        let plan = editor.plan.clone();
+        let prepared = prepare_split(&plan.files, &plan.findings.to_breaks(), &plan.metadata)
+            .and_then(|p| std::fs::create_dir_all(&out).map(|_| p).map_err(|e| format!("Failed to create '{}': {}", out.display(), e)));
+        let (segments, names) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                editor.set_status(e);
+                self.screen = Screen::Editor(editor);
+                return;
+            }
+        };
+        if let Some(path) = &self.plan_path {
+            if let Err(e) = plan.save(path) {
+                editor.set_status(format!("Couldn't save the plan: {}", e));
+            }
+        }
+        self.out = Some(out.clone());
+        let (files, cover) = (plan.files.clone(), plan.metadata.cover.clone());
+        let job = Job::spawn(move |emit| Ok(write_tracks(&segments, &names, &out, &files, &cover, emit)));
+        self.screen = Screen::Splitting { progress: Progress::new("Splitting"), job };
+    }
+
+    // Moves finished jobs on to the next screen. Called every frame.
+    pub fn tick(&mut self) {
+        let finished = match &mut self.screen {
+            Screen::Analyzing { progress, job } => drain(job, progress).map(Finished::Analysis),
+            Screen::Splitting { progress, job } => drain(job, progress).map(Finished::Split),
+            _ => None,
+        };
+        match finished {
+            Some(Finished::Analysis(Ok(plan))) => {
+                let mut notice = None;
+                if let Some(path) = &self.plan_path {
+                    let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).map_err(|e| e.to_string()).and_then(|_| plan.save(path));
+                    if let Err(e) = saved {
+                        notice = Some(format!("Couldn't save the plan: {}", e));
+                    }
+                }
+                let mut editor = Editor::new(plan);
+                editor.allow_back = true;
+                if let Some(n) = notice {
+                    editor.set_status(n);
+                }
+                self.screen = Screen::Editor(Box::new(editor));
+            }
+            Some(Finished::Analysis(Err(e))) => {
+                self.setup.error = e;
+                self.screen = Screen::Setup;
+            }
+            Some(Finished::Split(result)) => {
+                let out = self.out.clone().unwrap_or_default();
+                let info = match result {
+                    Ok(report) => DoneInfo { written: report.written.len(), failed: report.failed, out, plan_path: self.plan_path.clone(), error: None },
+                    Err(e) => DoneInfo { written: 0, failed: 0, out, plan_path: self.plan_path.clone(), error: Some(e) },
+                };
+                self.screen = Screen::Done(info);
+            }
+            None => {}
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.confirm_quit {
+            self.confirm_quit = false;
+            if key.code == KeyCode::Char('y') {
+                self.quit = true;
+            }
+            return;
+        }
+        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        match std::mem::replace(&mut self.screen, Screen::Setup) {
+            Screen::Setup => match self.setup.handle_key(key) {
+                SetupOutcome::Continue => {}
+                SetupOutcome::Quit => self.quit = true,
+                SetupOutcome::Start(req) => {
+                    if let Err(e) = self.start_analysis(req) {
+                        self.setup.error = e;
+                    }
+                }
+            },
+            screen @ (Screen::Analyzing { .. } | Screen::Splitting { .. }) => {
+                self.screen = screen;
+                if ctrl_c || key.code == KeyCode::Char('q') {
+                    self.confirm_quit = true;
+                }
+            }
+            Screen::Editor(mut editor) => match editor.handle_key(key) {
+                Outcome::Continue => self.screen = Screen::Editor(editor),
+                Outcome::Discard => self.quit = true,
+                Outcome::Back => self.screen = Screen::Setup,
+                Outcome::Save => match self.out.clone() {
+                    Some(out) => self.start_split(editor, out),
+                    None => {
+                        let browser = Browser::new("Choose the output folder", "", Pick::Folder);
+                        self.screen = Screen::PickOutput { editor, browser };
+                    }
+                },
+            },
+            Screen::PickOutput { editor, mut browser } => match browser.handle_key(key) {
+                BrowserOutcome::Continue => self.screen = Screen::PickOutput { editor, browser },
+                BrowserOutcome::Cancel => self.screen = Screen::Editor(editor),
+                BrowserOutcome::Chosen(out) => self.start_split(editor, out),
+            },
+            Screen::Done(info) => {
+                if key.code == KeyCode::Char('n') {
+                    self.screen = Screen::Setup;
+                } else if ctrl_c || matches!(key.code, KeyCode::Char('q') | KeyCode::Enter | KeyCode::Esc) {
+                    self.quit = true;
+                } else {
+                    self.screen = Screen::Done(info);
+                }
+            }
+        }
+    }
+
+    pub fn render(&mut self, f: &mut Frame) {
+        let area = f.area();
+        match &mut self.screen {
+            Screen::Setup => self.setup.render(f, area),
+            Screen::Analyzing { progress, .. } | Screen::Splitting { progress, .. } => progress.render(f, area),
+            Screen::Editor(editor) => editor.render(f),
+            Screen::PickOutput { editor, browser } => {
+                editor.render(f);
+                browser.render(f, area);
+            }
+            Screen::Done(info) => render_done(f, area, info),
+        }
+        if self.confirm_quit {
+            let rect = editor::centered(area, 60, 3);
+            f.render_widget(Clear, rect);
+            f.render_widget(Paragraph::new("A job is running. Quit anyway?   y quit    any other key: keep going").block(Block::bordered().title(" Quit ")), rect);
+        }
+    }
+}
+
+fn render_done(f: &mut Frame, area: Rect, info: &DoneInfo) {
+    let mut lines = Vec::new();
+    match &info.error {
+        Some(e) => lines.push(Line::raw(format!("The split failed: {}", e))),
+        None => {
+            lines.push(Line::raw(format!("Wrote {} file(s) to {}.", info.written, info.out.display())));
+            if info.failed > 0 {
+                lines.push(Line::raw(format!("{} file(s) could not be written; see the log lines above on the last screen or run `split` on the plan.", info.failed)));
+            }
+        }
+    }
+    if let Some(p) = &info.plan_path {
+        lines.push(Line::raw(format!("The plan is saved at {}.", p.display())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw("n  another book    q or Enter  quit"));
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Done ")), area);
+}
+
+// `tui`: the full-screen app, from choosing the book to splitting it.
+pub fn run(args: Args) -> Result<(), String> {
+    if !terminal::suitable(false) {
+        return Err("`tui` needs an interactive terminal at least 60 columns by 15 rows with TERM set. Use `run`, or `analyze`, `edit` and `split` step by step, instead.".into());
+    }
+    check_tools()?;
+    let mut app = App::new(args.path.as_deref().map(|p| user_path(&p.to_string_lossy())).as_deref())?;
+    let mut guard = TerminalGuard::new()?;
+    // `ratatui::try_init` made a panic hook that restores the terminal. A panic in a job thread
+    // is caught and shown as an error, so that hook must not run for it.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("tui-job") {
+            return;
+        }
+        previous(info);
+    }));
+    while !app.is_over() {
+        guard.terminal.draw(|f| app.render(f)).map_err(|e| e.to_string())?;
+        if event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key);
+                }
+            }
+        }
+        app.tick();
+    }
+    Ok(())
+}
 
 // Runs the full-screen chapter editor on `plan`. Returns whether to save; on true `*plan`
 // holds the edited plan. The terminal is restored before this returns.
@@ -34,5 +343,218 @@ pub fn edit(plan: &mut Plan, mut guard: TerminalGuard) -> Result<bool, String> {
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::edit::ops::sample_plan;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::Terminal;
+    use std::time::Duration;
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        k(KeyCode::Char(c))
+    }
+
+    // A 15 s WAV with two silences (4-6 s and 9-11 s) in a fresh folder: three chapters.
+    fn book(name: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("abs-app-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("book.wav");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "aevalsrc=if(between(t\\,4\\,6)+between(t\\,9\\,11)\\,0\\,sin(2*PI*440*t)):d=15", "-y"])
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        (dir, wav)
+    }
+
+    fn request(wav: &Path, out: &Path) -> setup::AnalyzeRequest {
+        setup::AnalyzeRequest {
+            inputs: vec![wav.to_path_buf()],
+            epub: None,
+            out: out.to_path_buf(),
+            settings: audiobook_splitter_rust::plan::Settings { min_silence: 1.0, ..Default::default() },
+            use_cache: false,
+        }
+    }
+
+    fn wait(app: &mut App, what: &str, until: impl Fn(&App) -> bool) {
+        for _ in 0..600 {
+            app.tick();
+            if until(app) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for {}", what);
+    }
+
+    fn in_editor(app: &App) -> bool {
+        matches!(app.screen, Screen::Editor(_))
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.render(f)).unwrap();
+        let buf = t.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn the_whole_flow_analyzes_edits_splits_and_finishes() {
+        let (dir, wav) = book("flow");
+        let out = dir.join("out");
+        let mut app = App::new(Some(wav.as_path())).unwrap();
+        assert!(matches!(app.screen, Screen::Setup));
+        app.start_analysis(request(&wav, &out)).unwrap();
+        assert!(matches!(app.screen, Screen::Analyzing { .. }));
+        wait(&mut app, "the analysis", in_editor);
+        let Screen::Editor(ed) = &app.screen else { unreachable!() };
+        assert_eq!(ed.plan.findings.breaks.iter().map(|b| b.title.as_str()).collect::<Vec<_>>(), ["Part 1", "Part 2", "Part 3"]);
+        assert!(out.join("plan.json").is_file(), "the plan is saved beside the output, as `run` does");
+
+        app.handle_key(ch('s'));
+        assert!(matches!(app.screen, Screen::Splitting { .. }));
+        wait(&mut app, "the split", |a| matches!(a.screen, Screen::Done(_)));
+        let Screen::Done(info) = &app.screen else { unreachable!() };
+        assert_eq!((info.written, info.failed), (3, 0));
+        let mut files: Vec<String> = std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".wav")).collect();
+        files.sort();
+        assert_eq!(files, ["00 - Part 1.wav", "01 - Part 2.wav", "02 - Part 3.wav"]);
+
+        let screen = draw(&mut app, 80, 24);
+        assert!(screen.contains("Wrote 3 file(s)"), "{}", screen);
+        app.handle_key(ch('n'));
+        assert!(matches!(app.screen, Screen::Setup), "another book returns to Setup");
+        assert!(!app.is_over());
+    }
+
+    #[test]
+    fn back_returns_to_setup_with_the_values_kept() {
+        let (dir, wav) = book("back");
+        let mut app = App::new(Some(wav.as_path())).unwrap();
+        app.start_analysis(request(&wav, &dir.join("out"))).unwrap();
+        wait(&mut app, "the analysis", in_editor);
+        app.handle_key(ch('b'));
+        assert!(matches!(app.screen, Screen::Setup));
+        let screen = draw(&mut app, 80, 24);
+        assert!(screen.contains("book.wav"), "the input is still filled in:\n{}", screen);
+    }
+
+    #[test]
+    fn quitting_the_editor_without_changes_ends_the_app() {
+        let mut app = App::with_plan(sample_plan(), None);
+        assert!(matches!(app.screen, Screen::Editor(_)));
+        app.handle_key(ch('q'));
+        assert!(app.is_over());
+    }
+
+    #[test]
+    fn saving_a_plan_with_no_output_folder_asks_for_one_and_esc_returns() {
+        let mut app = App::with_plan(sample_plan(), None);
+        app.handle_key(ch('s'));
+        assert!(matches!(app.screen, Screen::PickOutput { .. }));
+        assert!(draw(&mut app, 80, 24).contains("Choose the output folder"));
+        app.handle_key(k(KeyCode::Esc));
+        assert!(in_editor(&app), "cancelling the browser returns to the editor");
+    }
+
+    #[test]
+    fn a_plan_opened_directly_splits_into_the_chosen_folder() {
+        let (dir, wav) = book("plan");
+        let mut first = App::new(Some(wav.as_path())).unwrap();
+        first.start_analysis(request(&wav, &dir.join("analysis"))).unwrap();
+        wait(&mut first, "the analysis", in_editor);
+        let Screen::Editor(ed) = first.screen else { unreachable!() };
+        let out = dir.join("chosen");
+        std::fs::create_dir_all(&out).unwrap();
+        let mut app = App::with_plan(ed.plan.clone(), Some(dir.join("analysis").join("plan.json")));
+        app.handle_key(ch('s'));
+        let Screen::PickOutput { browser, .. } = &mut app.screen else { panic!("expected the output picker") };
+        *browser = browser::Browser::new("Choose the output folder", out.to_str().unwrap(), browser::Pick::Folder);
+        app.handle_key(ch(' '));
+        assert!(matches!(app.screen, Screen::Splitting { .. }));
+        wait(&mut app, "the split", |a| matches!(a.screen, Screen::Done(_)));
+        assert_eq!(std::fs::read_dir(&out).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".wav")).count(), 3);
+    }
+
+    #[test]
+    fn a_bad_template_sends_the_user_back_to_the_editor_with_the_reason() {
+        let mut plan = sample_plan();
+        plan.metadata.template = String::new();
+        let mut app = App::with_plan(plan, None);
+        app.out = Some(std::env::temp_dir().join(format!("abs-app-{}-badtemplate", std::process::id())));
+        app.handle_key(ch('s'));
+        assert!(in_editor(&app));
+        assert!(draw(&mut app, 80, 24).contains("naming convention"));
+    }
+
+    #[test]
+    fn a_failed_analysis_returns_to_setup_with_the_message() {
+        let mut app = App::new(None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        tx.send(jobs::Msg::Done(Err("None of the audio files could be analyzed.".into()))).unwrap();
+        app.tick();
+        assert!(matches!(app.screen, Screen::Setup));
+        assert!(draw(&mut app, 80, 24).contains("could be analyzed"));
+    }
+
+    #[test]
+    fn ctrl_c_during_a_job_asks_before_quitting() {
+        let mut app = App::new(None).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.is_over());
+        assert!(draw(&mut app, 80, 24).contains("Quit"));
+        app.handle_key(ch('n'));
+        assert!(!app.is_over());
+        app.handle_key(ch('q'));
+        app.handle_key(ch('y'));
+        assert!(app.is_over());
+    }
+
+    #[test]
+    fn every_screen_draws_at_the_minimum_size_and_smaller() {
+        let (dir, wav) = book("sizes");
+        let mut app = App::new(Some(wav.as_path())).unwrap();
+        for (w, h) in [(80, 24), (60, 15), (40, 8)] {
+            draw(&mut app, w, h);
+        }
+        app.start_analysis(request(&wav, &dir.join("out"))).unwrap();
+        for (w, h) in [(80, 24), (60, 15), (40, 8)] {
+            draw(&mut app, w, h);
+        }
+        wait(&mut app, "the analysis", in_editor);
+        for (w, h) in [(80, 24), (60, 15), (40, 8)] {
+            draw(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn a_broken_or_missing_plan_file_is_reported_not_opened() {
+        let dir = std::env::temp_dir().join(format!("abs-app-{}-badplan", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "not a plan").unwrap();
+        assert!(App::new(Some(bad.as_path())).is_err());
+        assert!(App::new(Some(dir.join("missing.json").as_path())).is_err());
+    }
+
+    #[test]
+    fn a_json_argument_is_a_plan_and_anything_else_a_book() {
+        assert!(is_plan_path(Path::new("plan.json")) && is_plan_path(Path::new("/x/Plan.JSON")));
+        assert!(!is_plan_path(Path::new("book.mp3")) && !is_plan_path(Path::new("/books/folder")));
     }
 }

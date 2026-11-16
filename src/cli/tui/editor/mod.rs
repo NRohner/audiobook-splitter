@@ -69,6 +69,11 @@ pub struct Editor {
 }
 
 impl Editor {
+    // Shows `text` in the footer (errors from outside the editor, such as a refused split).
+    pub fn set_status(&mut self, text: String) {
+        self.status = text;
+    }
+
     pub fn new(plan: Plan) -> Editor {
         let original = (plan.findings.breaks.clone(), plan.metadata.clone());
         Editor {
