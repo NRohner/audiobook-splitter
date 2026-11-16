@@ -11,9 +11,10 @@ mod split;
 mod time;
 
 use audiobook_splitter_rust::cache::Cache;
-use audiobook_splitter_rust::meta::Metadata;
+use audiobook_splitter_rust::meta::{Cover, Metadata};
 use audiobook_splitter_rust::pipeline::file_name;
 use audiobook_splitter_rust::plan::{Plan, Settings};
+use audiobook_splitter_rust::user_path;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -105,6 +106,9 @@ pub struct Tags {
     /// File naming, with {n} (counts from 00), {title} and {album}
     #[arg(long)]
     pub template: Option<String>,
+    /// Album artwork: `keep` (the source's own cover, default), `none`, or a JPEG/PNG path
+    #[arg(long, value_name = "keep|none|PATH")]
+    pub cover: Option<String>,
 }
 
 impl Tags {
@@ -120,6 +124,12 @@ impl Tags {
         set(&mut meta.genre, &self.genre);
         set(&mut meta.year, &self.year);
         set(&mut meta.template, &self.template);
+        match self.cover.as_deref() {
+            Some("keep") => meta.cover = Cover::Keep,
+            Some("none") => meta.cover = Cover::None,
+            Some(path) => meta.cover = Cover::File(user_path(path)),
+            None => {}
+        }
     }
 }
 
@@ -175,5 +185,30 @@ pub fn run(mut args: Vec<String>) {
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audiobook_splitter_rust::meta::Cover;
+
+    fn tags(cover: Option<&str>) -> Tags {
+        Tags { album: None, artist: None, album_artist: None, genre: None, year: None, template: None, cover: cover.map(String::from) }
+    }
+
+    #[test]
+    fn the_cover_flag_maps_onto_the_metadata() {
+        let mut meta = Metadata::default();
+        tags(Some("none")).apply(&mut meta);
+        assert_eq!(meta.cover, Cover::None);
+        tags(Some("/art/front.png")).apply(&mut meta);
+        assert_eq!(meta.cover, Cover::File("/art/front.png".into()));
+        tags(Some("'/art/with space.jpg'")).apply(&mut meta);
+        assert_eq!(meta.cover, Cover::File("/art/with space.jpg".into()), "quotes from pasted paths are stripped");
+        tags(Some("keep")).apply(&mut meta);
+        assert_eq!(meta.cover, Cover::Keep);
+        tags(None).apply(&mut meta);
+        assert_eq!(meta.cover, Cover::Keep, "no flag leaves the plan's choice alone");
     }
 }

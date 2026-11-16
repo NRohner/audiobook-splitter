@@ -2,7 +2,8 @@
 use super::progress::Reporter;
 use super::{check_tools, open_cache, place, Detect};
 use audiobook_splitter_rust::collect_inputs;
-use audiobook_splitter_rust::pipeline::{analyze, default_metadata, open_epub};
+use audiobook_splitter_rust::cover::find_embedded;
+use audiobook_splitter_rust::pipeline::{analyze, default_metadata, file_name, open_epub};
 use audiobook_splitter_rust::plan::Plan;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +63,10 @@ pub fn summary(plan: &Plan, plan_path: Option<&Path>) {
         println!("{:>3}  {:<28} {:<40} {}", i + 1, place(plan, b.file, b.at), b.title, score);
     }
     println!("\n{} chapter(s).", f.breaks.len());
+    match find_embedded(&plan.files) {
+        Some((i, _)) => println!("Cover: embedded in {}.", file_name(&plan.files[i].path)),
+        None => println!("Cover: none embedded in the source file(s); attach one with --cover."),
+    }
     if !f.missing.is_empty() {
         let names: Vec<String> = f.missing.iter().map(|m| format!("{}. {}", m.chapter + 1, m.title)).collect();
         println!("No break found for: {}", names.join(", "));

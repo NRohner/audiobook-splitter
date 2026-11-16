@@ -2,8 +2,11 @@
 // on the plan (unit-tested); the menu below only chooses which one to call.
 use super::time::{clock, parse_time};
 use super::{open_plan, place, prompt};
-use audiobook_splitter_rust::meta::Metadata;
+use audiobook_splitter_rust::cover::{find_embedded, validate};
+use audiobook_splitter_rust::meta::{Cover, Metadata};
+use audiobook_splitter_rust::pipeline::file_name;
 use audiobook_splitter_rust::plan::{Plan, PlanBreak};
+use audiobook_splitter_rust::user_path;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -107,6 +110,13 @@ pub fn unused_silences(plan: &Plan) -> Vec<Pos> {
 }
 
 // What Whisper heard either side of a break, if it transcribed there.
+// Sets the cover choice, refusing an image that isn't a readable JPEG or PNG.
+pub fn set_cover(plan: &mut Plan, cover: Cover) -> Result<(), String> {
+    validate(&cover)?;
+    plan.metadata.cover = cover;
+    Ok(())
+}
+
 fn heard(plan: &Plan, i: usize) -> Option<(&str, &str)> {
     let at = pos(plan.findings.breaks.get(i)?);
     let s = plan.findings.silences.iter().find(|s| same((s.file, s.at), at))?;
@@ -272,7 +282,30 @@ fn tags_menu(plan: &mut Plan) -> Result<(), String> {
     m.genre = ask("Genre", &m.genre, true)?;
     m.year = ask("Year", &m.year, true)?;
     m.template = ask("File naming: {n} (from 00), {title}, {album}", &m.template, false)?;
+    report(cover_menu(plan));
     Ok(())
+}
+
+fn cover_menu(plan: &mut Plan) -> Result<(), String> {
+    let embedded = find_embedded(&plan.files).map(|(i, _)| file_name(&plan.files[i].path));
+    let items = vec![
+        embedded.map_or("Keep the embedded cover (none found in the source files)".to_string(), |name| format!("Keep the cover embedded in {}", name)),
+        "No cover art".to_string(),
+        "Attach a JPEG or PNG image".to_string(),
+    ];
+    let current = match &plan.metadata.cover {
+        Cover::File(path) => path.display().to_string(),
+        _ => String::new(),
+    };
+    match pick("Cover art", &items)? {
+        Some(0) => set_cover(plan, Cover::Keep),
+        Some(1) => set_cover(plan, Cover::None),
+        Some(2) => {
+            let typed = ask("Image file", &current, false)?;
+            set_cover(plan, Cover::File(user_path(&typed)))
+        }
+        _ => Ok(()), // Esc: leave the choice as it was.
+    }
 }
 
 #[derive(clap::Args)]
@@ -400,5 +433,21 @@ mod tests {
         let p = plan();
         let at: Vec<f64> = unused_silences(&p).into_iter().map(|(_, at)| at).collect();
         assert_eq!(at, [10.0, 20.0, 45.0, 80.0]);
+    }
+
+    #[test]
+    fn set_cover_accepts_images_and_refuses_anything_else() {
+        let dir = std::env::temp_dir().join(format!("abs-edit-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, text) = (dir.join("c.png"), dir.join("c.txt"));
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0]).unwrap();
+        std::fs::write(&text, "hi").unwrap();
+        let mut p = plan();
+        set_cover(&mut p, Cover::File(png.clone())).unwrap();
+        assert_eq!(p.metadata.cover, Cover::File(png));
+        assert!(set_cover(&mut p, Cover::File(text)).is_err());
+        assert!(matches!(p.metadata.cover, Cover::File(_)), "a refused image leaves the old choice");
+        set_cover(&mut p, Cover::None).unwrap();
+        assert_eq!(p.metadata.cover, Cover::None);
     }
 }

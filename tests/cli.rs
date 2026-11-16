@@ -218,3 +218,65 @@ fn cache_clear_rejects_a_missing_path() {
         .failure()
         .stderr(contains("not a file or folder"));
 }
+
+// A 15 s MP3 book with a red cover, analyzed into `dir/plan.json`; also `dir/blue.png`.
+fn covered(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = common::temp_dir(name);
+    let red = dir.join("red.jpg");
+    common::image(&red, "red");
+    common::image(&dir.join("blue.png"), "blue");
+    let book = dir.join("book.mp3");
+    common::mp3_with_gaps(&book, Some(&red));
+    let plan = dir.join("plan.json");
+    bin().arg("analyze").arg(&book).args(["--min-silence", "1", "-o"]).arg(&plan).assert().success();
+    (dir, plan)
+}
+
+fn colors(out: &std::path::Path) -> Vec<Option<&'static str>> {
+    names(out).iter().map(|n| common::cover_color(&out.join(n))).collect()
+}
+
+#[test]
+fn analyze_reports_the_embedded_cover() {
+    let dir = common::temp_dir("cover-analyze");
+    let red = dir.join("red.jpg");
+    common::image(&red, "red");
+    let book = dir.join("book.mp3");
+    common::mp3_with_gaps(&book, Some(&red));
+    bin().arg("analyze").arg(&book).args(["--min-silence", "1", "-o"]).arg(dir.join("p.json")).assert().success().stdout(contains("Cover: embedded in book.mp3"));
+    let plain = dir.join("plain.mp3");
+    common::mp3_with_gaps(&plain, None);
+    bin().arg("analyze").arg(&plain).args(["--min-silence", "1", "-o"]).arg(dir.join("q.json")).assert().success().stdout(contains("Cover: none embedded"));
+}
+
+#[test]
+fn split_keeps_the_source_cover_by_default() {
+    let (dir, plan) = covered("cover-keep");
+    let out = dir.join("out");
+    bin().arg("split").arg(&plan).arg("-o").arg(&out).assert().success();
+    assert_eq!(colors(&out), [Some("red"), Some("red"), Some("red")]);
+}
+
+#[test]
+fn split_cover_flag_attaches_an_image_to_every_file() {
+    let (dir, plan) = covered("cover-image");
+    let out = dir.join("out");
+    bin().arg("split").arg(&plan).arg("-o").arg(&out).arg("--cover").arg(dir.join("blue.png")).assert().success();
+    assert_eq!(colors(&out), [Some("blue"), Some("blue"), Some("blue")]);
+}
+
+#[test]
+fn split_cover_none_writes_files_without_artwork() {
+    let (dir, plan) = covered("cover-none");
+    let out = dir.join("out");
+    bin().arg("split").arg(&plan).arg("-o").arg(&out).args(["--cover", "none"]).assert().success();
+    assert_eq!(colors(&out), [None, None, None]);
+}
+
+#[test]
+fn split_rejects_a_bad_cover_before_writing_anything() {
+    let (dir, plan) = covered("cover-bad");
+    let out = dir.join("out");
+    bin().arg("split").arg(&plan).arg("-o").arg(&out).args(["--cover", "missing.png"]).assert().failure().stderr(contains("missing.png"));
+    assert!(!out.exists(), "nothing is created when the cover is bad");
+}
