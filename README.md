@@ -28,12 +28,13 @@ A Rust application (local web GUI plus a full command-line interface that works 
 
 ## Setup
 
-You need four things on any platform:
+You need five things on any platform:
 
 * **Rust** (with Cargo): <https://www.rust-lang.org/tools/install>
 * **CMake** and a **C/C++ compiler**: the Whisper speech-to-text engine (whisper.cpp) is compiled into the app.
+* **Clang / libclang**: the Whisper bindings use it at build time to generate their Rust interface (the Xcode command line tools include it on macOS; Linux and Windows install it separately, see below).
 * **FFmpeg and FFprobe** on your `PATH`: the app uses them to analyze and split audio.
-* The **Whisper model** (`models/ggml-base.en.bin`, ~148 MB): downloaded once, see below.
+* The **Whisper model** (`models/ggml-base.en.bin`, ~148 MB): the app downloads it with `curl` the first time it is needed (or run `make model` up front); see below.
 
 Windows also needs the **Vulkan SDK**, so Whisper can run on the GPU.
 
@@ -66,6 +67,32 @@ Windows also needs the **Vulkan SDK**, so Whisper can run on the GPU.
     ```
 
 On Apple Silicon, Whisper runs on the GPU via Metal.
+
+### Linux
+
+1.  **Install the build tools** (C/C++ compiler, CMake, and Clang, whose headers the Whisper bindings need at build time), plus FFmpeg. On Debian/Ubuntu:
+
+    ```bash
+    sudo apt install build-essential cmake clang ffmpeg curl git
+    ```
+
+    Fedora: `sudo dnf install gcc-c++ cmake clang ffmpeg`. Arch: `sudo pacman -S base-devel cmake clang ffmpeg`. (Fedora needs the RPM Fusion repo for the full `ffmpeg`.)
+
+2.  **Install Rust:**
+
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+
+3.  **Clone and run:**
+
+    ```bash
+    git clone https://github.com/NRohner/audiobook-splitter.git
+    cd audiobook-splitter
+    make run     # downloads the Whisper model on first run, builds the release binary, opens the GUI
+    ```
+
+Whisper runs on the CPU on Linux. The native **File** / **Folder** / **Browse** dialogs use the desktop's file-chooser portal (`xdg-desktop-portal` plus your desktop's backend, which GNOME, KDE and most others ship); if there is none, type the path instead. The GUI opens your browser with `xdg-open`.
 
 ### Windows
 
@@ -124,7 +151,7 @@ On Apple Silicon, Whisper runs on the GPU via Metal.
 
 ## Running
 
-| macOS | Windows (PowerShell) | What it does |
+| macOS / Linux | Windows (PowerShell) | What it does |
 |---|---|---|
 | `make model` | see step 5 above | One-time: download the Whisper model into `models/` |
 | `make dev` | `cargo run -- gui` | Debug build, starts the GUI and opens your browser |

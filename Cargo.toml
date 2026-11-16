@@ -10,7 +10,8 @@ epub = "2"
 indicatif = "0.18"
 regex = "1"
 ratatui = "0.30"
-rfd = "0.17"
+# No "wayland" feature: it links libwayland via pkg-config, and a dialog needs no parent window.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
@@ -24,8 +25,8 @@ whisper-rs = { version = "0.16", features = ["metal"] }
 
 # Vulkan runs on NVIDIA, AMD and Intel GPUs through the driver's vulkan-1.dll, so one
 # build covers them all; whisper.cpp falls back to the CPU if no Vulkan device is found.
-# Building needs the Vulkan SDK (VULKAN_SDK set). Linux supports the same backend: widen
-# this to cfg(any(windows, target_os = "linux")) and install libvulkan-dev and glslc.
+# Building needs the Vulkan SDK (VULKAN_SDK set). Linux supports the same backend but is
+# CPU-only for now: to enable it, widen this to cfg(any(windows, target_os = "linux")) and install libvulkan-dev and glslc.
 [target.'cfg(windows)'.dependencies]
 whisper-rs = { version = "0.16", features = ["vulkan"] }
 
