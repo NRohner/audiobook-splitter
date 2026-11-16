@@ -202,7 +202,7 @@ A re-scan searches only the stretch between the nearest found chapters either si
 
 Cover art is chosen in the tags form: keep the embedded cover, use none, or use an image (Ctrl-B on the image row opens the file browser for a JPEG or PNG).
 
-File browser keys: Enter opens a folder or picks a file, Space picks the current folder (where a folder is wanted), Backspace goes up, `/` filters the list, `.` shows or hides hidden files, Tab types a path, `~` jumps to the home folder, Esc cancels.
+File browser keys: Enter opens a folder or picks a file, Space picks the current folder (where a folder is wanted), Backspace or Left goes up, Right opens the selected folder, `/` filters the list, `.` shows or hides hidden files, Tab types a path, `~` jumps to the home folder, Esc cancels.
 
 ### Resuming and the cache
 

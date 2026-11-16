@@ -205,6 +205,11 @@ impl Browser {
                     }
                 }
             }
+            KeyCode::Right => {
+                if let Some(e) = self.visible().get(self.selected).filter(|e| e.is_dir).map(|e| (*e).clone()) {
+                    self.enter(self.dir.join(&e.name));
+                }
+            }
             KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.up(),
             KeyCode::Char('~') => self.enter(home_or_cwd()),
             KeyCode::Char('/') => self.filtering = true,
@@ -400,6 +405,17 @@ mod tests {
         assert_eq!(names(&list_dir(&dir, Pick::Folder, false).unwrap()), ["A/", "b/"]);
         assert_eq!(names(&list_dir(&dir, Pick::File(&["png"]), false).unwrap()), ["A/", "b/", "cover.PNG"], "extensions match in any case");
         assert!(list_dir(&dir.join("nope"), MP3, false).unwrap_err().contains("Can't read"));
+    }
+
+    #[test]
+    fn right_arrow_opens_a_folder_but_never_picks_a_file() {
+        let dir = tree("right");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        b.handle_key(ch('j'));
+        b.handle_key(k(KeyCode::Right));
+        assert_eq!(b.dir(), dir.join("b"));
+        assert_eq!(b.selected_name().as_deref(), Some("inner.mp3"));
+        assert!(matches!(b.handle_key(k(KeyCode::Right)), BrowserOutcome::Continue), "a file is not picked by Right");
     }
 
     #[test]
