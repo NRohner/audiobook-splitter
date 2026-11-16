@@ -181,6 +181,15 @@ mod tests {
         wav
     }
 
+    // Linux has no built-in speech engine: this needs espeak-ng (`apt install espeak-ng`).
+    #[cfg(target_os = "linux")]
+    fn speak(text: &str) -> PathBuf {
+        let wav = std::env::temp_dir().join(format!("abs-say-{}-{}.wav", std::process::id(), text.len()));
+        let status = Command::new("espeak-ng").arg("-w").arg(&wav).arg(text).status();
+        assert!(status.is_ok_and(|s| s.success()), "espeak-ng is needed for this test (apt install espeak-ng)");
+        wav
+    }
+
     // Needs the model (`make model`) and the OS text-to-speech engine: cargo test -- --ignored
     #[test]
     #[ignore]
