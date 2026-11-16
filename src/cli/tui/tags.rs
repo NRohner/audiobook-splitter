@@ -25,3 +25,6 @@ impl TagsForm {
         Ok(())
     }
 }
+impl TagsForm {
+    pub fn render(&self, _f: &mut ratatui::Frame, _area: ratatui::layout::Rect) {}
+}

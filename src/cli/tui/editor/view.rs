@@ -1,3 +1,276 @@
-impl super::Editor {
-    pub fn render(&mut self, _f: &mut ratatui::Frame) {}
+// Drawing the editor: the chapter table, the detail pane, the footer and the popups.
+use super::*;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
+use ratatui::Frame;
+
+const HELP: &[(&str, &str)] = &[
+    ("Up/Down, j/k, PgUp/PgDn, Home/End", "move the selection"),
+    ("Enter, r", "rename the chapter"),
+    ("[  ]", "move the break to the previous / next silence"),
+    ("d", "remove the chapter"),
+    ("a", "add a chapter at a time"),
+    ("n", "add a chapter at a silence that has none"),
+    ("m", "chapters the EPUB match missed"),
+    ("t", "tags, file naming and cover art"),
+    ("g", "jump to a time (1:02:03) or a chapter number"),
+    ("p", "write a preview clip of the selected break"),
+    ("u / Ctrl-r", "undo / redo"),
+    ("s", "save and continue"),
+    ("q, Ctrl-c", "quit (asks if there are unsaved changes)"),
+    ("b", "back to Setup (only in `tui`)"),
+    ("?", "this help"),
+];
+
+pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
+}
+
+impl Editor {
+    pub fn render(&mut self, f: &mut Frame) {
+        let area = f.area();
+        let detail_h = match area.height {
+            0..=14 => 1,
+            15..=19 => 4,
+            _ => 7,
+        };
+        let [table_area, detail_area, footer_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(detail_h), Constraint::Length(2)]).areas(area);
+        self.render_table(f, table_area);
+        self.render_detail(f, detail_area);
+        self.render_footer(f, footer_area);
+        self.render_popup(f, area);
+    }
+
+    fn render_table(&mut self, f: &mut Frame, area: Rect) {
+        let multi = self.plan.files.len() > 1;
+        let where_w = if multi { 30 } else { 9 };
+        let rows: Vec<Row> = self
+            .plan
+            .findings
+            .breaks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let score = b.score.map_or("-".to_string(), |s| format!("{:.2}", s));
+                let fixed = if ops::is_fixed(b) { "*" } else { "" };
+                Row::new(vec![format!("{}{}", i + 1, fixed), place(&self.plan, b.file, b.at), b.title.clone(), score])
+            })
+            .collect();
+        let title = format!(" Chapters ({}){} ", rows.len(), if self.changed() { " *" } else { "" });
+        let table = Table::new(rows, [Constraint::Length(5), Constraint::Length(where_w), Constraint::Fill(1), Constraint::Length(5)])
+            .header(Row::new(vec!["#", "Where", "Title", "Match"]).style(Style::new().add_modifier(Modifier::BOLD)))
+            .block(Block::bordered().title(title))
+            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+            .highlight_symbol(">");
+        self.table.select(Some(self.selected));
+        f.render_stateful_widget(table, area, &mut self.table);
+    }
+
+    fn render_detail(&self, f: &mut Frame, area: Rect) {
+        let Some(b) = self.plan.findings.breaks.get(self.selected) else { return };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("Chapter {}: ", self.selected + 1), Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("{}  at {}", b.title, place(&self.plan, b.file, b.at))),
+        ])];
+        if ops::is_fixed(b) {
+            lines.push(Line::raw("The first chapter starts the book and can't be moved or removed."));
+        }
+        match ops::heard(&self.plan, self.selected) {
+            Some((before, after)) => {
+                lines.push(Line::raw(format!("Heard before: {}", before)));
+                lines.push(Line::raw(format!("Heard after:  {}", after)));
+            }
+            None => lines.push(Line::raw("Nothing was transcribed here (no EPUB, or the break was added by hand).")),
+        }
+        let silence = |dir| ops::neighbour(&self.plan, self.selected, dir).map_or("none".to_string(), |(_, at)| clock(at));
+        lines.push(Line::raw(format!("Previous silence: {}   Next silence: {}", silence(-1), silence(1))));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(Block::bordered().title(" Detail ")), area);
+    }
+
+    fn render_footer(&self, f: &mut Frame, area: Rect) {
+        let keys = if area.width >= 100 {
+            "j/k move  r rename  [ ] move break  d remove  a add  n silence  m missing  t tags  g jump  p preview  u undo  s save  q quit  ? help"
+        } else if area.width >= 62 {
+            "r rename  [ ] move  d remove  a add  t tags  u undo  s save  q quit  ? help"
+        } else {
+            "? help  s save  q quit"
+        };
+        let status = Span::styled(self.status.clone(), Style::new().fg(Color::Yellow));
+        f.render_widget(Paragraph::new(vec![Line::raw(keys), Line::from(status)]), area);
+    }
+
+    fn render_popup(&self, f: &mut Frame, area: Rect) {
+        match &self.mode {
+            Mode::Normal => {}
+            Mode::Prompt { kind, input } => {
+                let title = match kind {
+                    Prompt::Rename(_) => " New title ",
+                    Prompt::AddTime(_) => " Start time (h:mm:ss) ",
+                    Prompt::AddTitle(..) => " Chapter title ",
+                    Prompt::Jump => " Jump to a time or a chapter number ",
+                };
+                let rect = centered(area, 60, 3);
+                let inner_w = rect.width.saturating_sub(2) as usize;
+                let (text, col) = input.view(inner_w);
+                f.render_widget(Clear, rect);
+                f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), rect);
+                f.set_cursor_position((rect.x + 1 + col as u16, rect.y + 1));
+            }
+            Mode::List { kind, items, selected } => {
+                let title = match kind {
+                    ListKind::AddFile => " Which file? ",
+                    ListKind::Silence { .. } => " Start a chapter at ",
+                    ListKind::Missing => " Chapters with no break (Enter: choose a silence) ",
+                };
+                let rect = centered(area, 70, (items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3));
+                let mut state = ListState::default();
+                state.select(Some(*selected));
+                let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
+                    .block(Block::bordered().title(title))
+                    .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
+                    .highlight_symbol(">");
+                f.render_widget(Clear, rect);
+                f.render_stateful_widget(list, rect, &mut state);
+            }
+            Mode::Tags(form) => form.render(f, area),
+            Mode::ConfirmQuit => confirm(f, area, " Unsaved changes ", "s save and continue    d discard    Esc keep editing"),
+            Mode::ConfirmBack => confirm(f, area, " Go back? ", "Your edits to the chapters will be lost.    y go back    Esc stay"),
+            Mode::Help => {
+                let rect = centered(area, 78, HELP.len() as u16 + 2);
+                let lines: Vec<Line> = HELP.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("{:<36}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(*d)])).collect();
+                f.render_widget(Clear, rect);
+                f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")), rect);
+            }
+        }
+    }
+}
+
+fn confirm(f: &mut Frame, area: Rect, title: &str, text: &str) {
+    let rect = centered(area, 72, 3);
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use crate::cli::edit::ops::sample_plan;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(ed: &mut Editor, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ed.render(f)).unwrap();
+        let buf = t.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn k(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn shows_the_chapters_the_selection_and_the_keys() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('j'));
+        let screen = draw(&mut ed, 80, 24);
+        for want in ["Chapters (3)", "One", "Two", "Three", "0:00:30", "q quit"] {
+            assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
+        }
+        let marked: Vec<&str> = screen.lines().filter(|l| l.contains('>')).collect();
+        assert_eq!(marked.len(), 1);
+        assert!(marked[0].contains("Two"), "the marker is on the selected row: {:?}", marked);
+    }
+
+    #[test]
+    fn the_detail_pane_shows_what_was_heard_or_says_nothing_was() {
+        let mut p = sample_plan();
+        p.findings.silences[3].before = "the end of the last chapter".into();
+        p.findings.silences[3].after = "chapter two begins here".into();
+        let mut ed = Editor::new(p);
+        ed.handle_key(k('j')); // the break at 30 s sits on the silence at 30 s
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("chapter two begins here"), "{}", screen);
+        assert!(screen.contains("the end of the last chapter"), "{}", screen);
+        let mut plain = Editor::new(sample_plan());
+        plain.handle_key(k('j'));
+        assert!(draw(&mut plain, 80, 24).contains("Nothing was transcribed here"));
+    }
+
+    #[test]
+    fn the_first_chapter_is_marked_fixed_and_changes_show_in_the_title() {
+        let mut ed = Editor::new(sample_plan());
+        assert!(draw(&mut ed, 80, 24).contains("starts the book"));
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        assert!(draw(&mut ed, 80, 24).contains("Chapters (3) *"), "unsaved changes are flagged");
+    }
+
+    #[test]
+    fn popups_draw_over_the_table() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('r'));
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("New title") && screen.contains("One"), "{}", screen);
+        ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ed.handle_key(k('n'));
+        assert!(draw(&mut ed, 80, 24).contains("Start a chapter at"));
+        ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ed.handle_key(k('?'));
+        let help = draw(&mut ed, 80, 24);
+        assert!(help.contains("undo") && help.contains("jump"), "{}", help);
+        ed.handle_key(k('x'));
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        ed.handle_key(k('q'));
+        assert!(draw(&mut ed, 80, 24).contains("Unsaved changes"));
+    }
+
+    #[test]
+    fn the_status_line_shows_refusals() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('d'));
+        assert!(draw(&mut ed, 80, 24).contains("can't be removed"));
+    }
+
+    #[test]
+    fn the_minimum_size_and_long_titles_do_not_panic() {
+        let mut p = sample_plan();
+        p.findings.breaks[1].title = "A very long chapter title ".repeat(12);
+        let mut ed = Editor::new(p);
+        for (w, h) in [(60, 15), (60, 12), (40, 8), (20, 5), (200, 60)] {
+            let screen = draw(&mut ed, w, h);
+            assert!(!screen.is_empty());
+        }
+        let small = draw(&mut ed, 60, 15);
+        assert!(small.contains("One") && small.contains("? help"), "{}", small);
+        ed.handle_key(k('r'));
+        draw(&mut ed, 60, 15);
+        ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ed.handle_key(k('?'));
+        draw(&mut ed, 60, 15);
+    }
+
+    #[test]
+    fn a_long_list_scrolls_to_keep_the_selection_visible() {
+        let mut p = sample_plan();
+        p.files[0].duration = 10_000.0;
+        for n in 1..=40 {
+            crate::cli::edit::ops::add(&mut p, 0, 100.0 + n as f64 * 10.0, &format!("Extra {}", n)).unwrap();
+        }
+        let mut ed = Editor::new(p);
+        ed.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("Extra 40") && !screen.contains("Extra 1 "), "{}", screen);
+        ed.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert!(draw(&mut ed, 80, 24).contains("One"));
+    }
 }
