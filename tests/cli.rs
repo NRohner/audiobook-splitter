@@ -293,3 +293,15 @@ fn edit_still_needs_a_terminal_when_stdin_is_piped() {
     let _ = dir;
     bin().arg("edit").arg(&plan).assert().failure().stderr(contains("interactive terminal"));
 }
+
+#[test]
+fn tui_is_listed_and_documents_its_argument() {
+    bin().arg("--help").assert().success().stdout(contains("tui"));
+    bin().args(["tui", "--help"]).assert().success().stdout(contains("PATH")).stdout(contains("plan file"));
+}
+
+#[test]
+fn tui_needs_a_terminal_and_says_what_to_use_instead() {
+    // assert_cmd pipes stdin and stdout, so this is not a terminal.
+    bin().arg("tui").assert().failure().stderr(contains("interactive terminal")).stderr(contains("run"));
+}
