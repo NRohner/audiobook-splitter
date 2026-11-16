@@ -4,6 +4,7 @@
 // analysis and splitting run on a background thread and the page polls /status.
 use audiobook_splitter_rust::cache::Cache;
 use audiobook_splitter_rust::chapters::{AudioFile, Break};
+use audiobook_splitter_rust::cover;
 use audiobook_splitter_rust::meta::Metadata;
 use audiobook_splitter_rust::pipeline::{self, default_metadata, file_name, open_epub, EpubInput, Event, LazyTranscriber, PREVIEW_SECONDS};
 use audiobook_splitter_rust::plan::{Findings, Settings};
@@ -49,6 +50,7 @@ struct Status {
     #[serde(flatten)]
     findings: Findings, // breaks, silences and missing for the page (`found` too, which it ignores).
     meta: Metadata,     // Suggested tags.
+    cover_source: Option<String>, // Name of the first file with an embedded cover, for the page's "Keep" option.
     log: Vec<String>,
     #[serde(skip)]
     analyzed: Vec<AudioFile>, // Same order as `audio`.
@@ -214,7 +216,36 @@ fn browse(req: BrowseReq) -> Result<Value, String> {
         .and_then(|exe| Command::new(exe).args(["--pick", &req.kind]).output())
         .map_err(|e| format!("Failed to open the file dialog: {}", e))?;
     let path = String::from_utf8_lossy(&output.stdout).into_owned();
-    Ok(json!({ "path": Some(path).filter(|p| !p.is_empty()) }))
+    let path = Some(path).filter(|p| !p.is_empty());
+    // An image is checked at pick time so a bad file is refused straight away.
+    let thumb = match (req.kind.as_str(), &path) {
+        ("image", Some(p)) => thumbnail(std::path::Path::new(p))?,
+        _ => None,
+    };
+    Ok(json!({ "path": path, "thumb": thumb }))
+}
+
+// A `data:` URL for the page to show a picked image, or None if the file is too big to inline.
+// Errors if it isn't a JPEG or PNG.
+fn thumbnail(path: &std::path::Path) -> Result<Option<String>, String> {
+    let mime = if cover::sniff(path)? == "png" { "image/png" } else { "image/jpeg" };
+    if std::fs::metadata(path).map_err(|e| e.to_string())?.len() > 8_000_000 {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Can't read '{}': {}", path.display(), e))?;
+    Ok(Some(format!("data:{};base64,{}", mime, base64(&bytes))))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
 }
 
 // Runs in the `--pick` child process: shows one dialog and prints the chosen path.
@@ -223,6 +254,7 @@ pub fn pick(kind: &str) {
     let picked = match kind {
         "file" => dialog.add_filter("Audio", &AUDIO_EXTENSIONS).pick_file(),
         "epub" => dialog.add_filter("EPUB", &["epub"]).pick_file(),
+        "image" => dialog.add_filter("Image", &["jpg", "jpeg", "png"]).pick_file(),
         _ => dialog.pick_folder(),
     };
     if let Some(path) = picked {
@@ -306,6 +338,7 @@ fn start_analyze(req: AnalyzeReq, state: &Shared, cache: &Arc<Cache>) -> Result<
                 }
                 s.audio = a.files.iter().map(|f| AudioRow { name: file_name(&f.path), duration: f.duration }).collect();
                 s.findings = a.findings;
+                s.cover_source = cover::find_embedded(&a.files).map(|(i, _)| file_name(&a.files[i].path));
                 s.analyzed = a.files;
                 s.epub = epub.map(|input| Arc::new(EpubRun { input, settings }));
                 s.log.push("Analysis complete.".into());
@@ -405,6 +438,25 @@ fn start_split(req: SplitReq, state: &Shared) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (input, want) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64(input.as_bytes()), want, "{:?}", input);
+        }
+    }
+
+    #[test]
+    fn thumbnail_is_a_data_url_for_images_and_an_error_for_anything_else() {
+        let dir = std::env::temp_dir().join(format!("abs-gui-thumb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (png, text) = (dir.join("c.png"), dir.join("c.txt"));
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0]).unwrap();
+        std::fs::write(&text, "not an image").unwrap();
+        let url = thumbnail(&png).unwrap().unwrap();
+        assert!(url.starts_with("data:image/png;base64,iVBORw0KGgo"), "{}", url);
+        assert!(thumbnail(&text).is_err());
+    }
 
     #[test]
     fn clip_rejects_unknown_audio() {
