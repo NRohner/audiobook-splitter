@@ -50,25 +50,35 @@ pub struct Silence {
     pub duration: f64,
 }
 
-// Returns the supported audio files directly inside `dir`, sorted by file name.
+// Returns the supported audio files inside `dir` and its subfolders, sorted by path.
 pub fn scan_folder(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read folder '{}': {}", dir.display(), e))?;
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        })
-        .collect();
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let mut files = Vec::new();
+    scan_into(dir, &mut files)?;
+    files.sort();
     Ok(files)
 }
 
-// A file path yields just that file; a folder yields its audio files.
+fn scan_into(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read folder '{}': {}", dir.display(), e))?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        // file_type() doesn't follow symlinks, so symlinked folders can't loop.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            scan_into(&path, files)?;
+        } else if path.is_file()
+            && path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+// A file path yields just that file; a folder yields its audio files, subfolders included.
 pub fn collect_inputs(path: &Path) -> Result<Vec<PathBuf>, String> {
     if path.is_file() {
         Ok(vec![path.to_path_buf()])
@@ -607,6 +617,23 @@ size=N/A time=00:00:10.00
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["a.wav", "b.MP3", "c.flac", "d.m4b"]);
+    }
+
+    #[test]
+    fn scan_folder_recurses_into_subfolders() {
+        let dir = temp_dir("scan_rec");
+        for sub in ["Part 2", "Part 1", "Part 1/Disc A"] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        for name in ["Part 2/01.mp3", "Part 1/02.mp3", "Part 1/Disc A/01.mp3", "Part 1/notes.txt"] {
+            fs::write(dir.join(name), b"").unwrap();
+        }
+        let rel: Vec<_> = scan_folder(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(rel, vec!["Part 1/02.mp3", "Part 1/Disc A/01.mp3", "Part 2/01.mp3"]);
     }
 
     #[test]
