@@ -1,4 +1,4 @@
-// Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows).
+// Local speech-to-text with Whisper (whisper.cpp: Metal GPU on macOS, Vulkan GPU on Windows and Linux).
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex};

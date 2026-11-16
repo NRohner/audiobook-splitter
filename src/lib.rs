@@ -3,6 +3,7 @@ pub mod book;
 pub mod cache;
 pub mod chapters;
 pub mod cover;
+pub mod gpu;
 pub mod matching;
 pub mod meta;
 pub mod pipeline;
