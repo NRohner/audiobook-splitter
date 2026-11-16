@@ -158,7 +158,7 @@ impl Editor {
                 state.select(Some(*selected));
                 let mut block = Block::bordered().title(title);
                 if matches!(kind, ListKind::Missing) {
-                    let hints = [("Enter", "place by hand"), ("R", "re-scan"), ("A", "re-scan all"), ("Esc", "close")];
+                    let hints = [("Enter", "place by hand"), ("r", "re-scan"), ("a", "re-scan all"), ("Esc", "close")];
                     block = block.title_bottom(Line::from(hint_spans(&hints)));
                 }
                 let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
@@ -479,7 +479,7 @@ mod tests {
             ed.handle_key(k('m'));
             let screen = draw(&mut ed, w, h);
             if w >= 60 {
-                for want in ["Enter place", "R re-scan", "A re-scan all", "Esc close"] {
+                for want in ["Enter place", "r re-scan", "a re-scan all", "Esc close"] {
                     assert!(screen.contains(want), "missing {:?} at {}x{}:\n{}", want, w, h, screen);
                 }
                 assert!(screen.contains("Lost 0") || h < 24, "{}", screen);

@@ -187,7 +187,7 @@ Editor keys (`?` shows them in the app):
 | `d` | Remove the chapter |
 | `a` | Add a chapter at a time |
 | `n` | Add a chapter at a silence |
-| `m` | List the chapters the EPUB match missed (the table title shows how many); in the list Enter picks a silence to place one by hand, `R` re-scans the highlighted chapter and `A` re-scans all of them |
+| `m` | List the chapters the EPUB match missed (the table title shows how many); in the list Enter picks a silence to place one by hand, `r` re-scans the highlighted chapter, `a` re-scans all of them, and `m` or Esc closes the list |
 | `R` | Re-scan all missing chapters (`tui` only, needs the plan's EPUB) |
 | `t` | Tags, file naming and cover art |
 | `g` | Jump to a time (`1:02:03`) or a chapter number |

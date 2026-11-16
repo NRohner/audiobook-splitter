@@ -462,13 +462,15 @@ impl Editor {
                 self.choose(kind, selected);
                 return Outcome::Continue;
             }
-            KeyCode::Char('R') if matches!(kind, ListKind::Missing) => {
+            // In this list the letters are free, so both cases work (in the editor itself a plain `r` renames).
+            KeyCode::Char('R' | 'r') if matches!(kind, ListKind::Missing) => {
                 return match self.plan.findings.missing.get(selected) {
                     Some(m) => self.request_rescan(vec![m.chapter]),
                     None => Outcome::Continue,
                 };
             }
-            KeyCode::Char('A') if matches!(kind, ListKind::Missing) => return self.rescan_all(),
+            KeyCode::Char('A' | 'a') if matches!(kind, ListKind::Missing) => return self.rescan_all(),
+            KeyCode::Char('m') if matches!(kind, ListKind::Missing) => return Outcome::Continue, // `m` again closes the list
             _ => {}
         }
         self.mode = Mode::List { kind, items, selected };
@@ -863,6 +865,28 @@ mod tests {
         press(&mut ed, "m");
         ed.handle_key(k(KeyCode::Enter));
         assert!(matches!(ed.mode, Mode::List { kind: ListKind::Silence { .. }, .. }), "Enter still places by hand");
+    }
+
+    #[test]
+    fn lowercase_r_and_a_work_in_the_missing_list_and_m_closes_it() {
+        let mut ed = missing_editor();
+        press(&mut ed, "m");
+        ed.handle_key(k(KeyCode::Down));
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('r')))), vec![3], "lowercase r re-scans the highlighted chapter");
+        assert!(matches!(ed.mode, Mode::Normal), "and did not start a rename");
+        press(&mut ed, "m");
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('a')))), vec![3, 4], "lowercase a re-scans all");
+        press(&mut ed, "m");
+        assert!(matches!(ed.mode, Mode::List { kind: ListKind::Missing, .. }));
+        assert!(matches!(ed.handle_key(k(KeyCode::Char('m'))), Outcome::Continue));
+        assert!(matches!(ed.mode, Mode::Normal), "m again closes the list");
+        // The other lists are untouched: in the silence picker r and a do nothing.
+        let mut other = missing_editor();
+        press(&mut other, "n");
+        assert!(matches!(other.mode, Mode::List { kind: ListKind::Silence { .. }, .. }));
+        other.handle_key(k(KeyCode::Char('r')));
+        other.handle_key(k(KeyCode::Char('m')));
+        assert!(matches!(other.mode, Mode::List { kind: ListKind::Silence { .. }, .. }), "r and m do nothing in the silence list");
     }
 
     #[test]
