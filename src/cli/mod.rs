@@ -9,6 +9,7 @@ mod rescan;
 mod run;
 mod split;
 mod time;
+mod tui;
 
 use audiobook_splitter_rust::cache::Cache;
 use audiobook_splitter_rust::meta::{Cover, Metadata};
