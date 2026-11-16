@@ -208,8 +208,12 @@ impl Editor {
             self.selected = i;
         }
         let still = self.plan.findings.missing.len();
-        let mut status = if found == 0 {
+        let mut status = if found == 0 && asked == 1 {
+            "No match found for the missing chapter (a re-scan can't do more with these settings).".to_string()
+        } else if found == 0 {
             format!("No match found for the {} missing chapters (a re-scan can't do more with these settings).", asked)
+        } else if found >= asked && asked == 1 {
+            "Found the missing chapter.".to_string()
         } else if found >= asked {
             format!("Found {} of {} missing chapters.", found, asked)
         } else {
@@ -926,6 +930,13 @@ mod tests {
         let mut ed = missing_editor();
         ed.apply_rescan(ed.plan.findings.clone(), 2, 2, None);
         assert_eq!(ed.status, "Found 2 of 2 missing chapters.");
+        // A single chapter reads as singular.
+        let mut ed = missing_editor();
+        ed.apply_rescan(ed.plan.findings.clone(), 1, 0, None);
+        assert_eq!(ed.status, "No match found for the missing chapter (a re-scan can't do more with these settings).");
+        let mut ed = missing_editor();
+        ed.apply_rescan(ed.plan.findings.clone(), 1, 1, None);
+        assert_eq!(ed.status, "Found the missing chapter.");
         let mut ed = missing_editor();
         let f = rescanned(&ed);
         ed.apply_rescan(f, 2, 1, Some("ffmpeg died".into()));
