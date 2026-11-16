@@ -55,6 +55,36 @@ pub fn wrap_hints(pairs: &[(&str, &str)], sep: &str, width: usize) -> Vec<Line<'
     lines
 }
 
+// Word-wraps `text` to `width` columns; a word longer than a line is split hard.
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_string();
+        while word.chars().count() > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let head: String = word.chars().take(width).collect();
+            word = word.chars().skip(width).collect();
+            lines.push(head);
+        }
+        let used = cur.chars().count();
+        if used > 0 && used + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(&word);
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
 // Test helper: the buffer cell where `needle` first starts in a row.
 #[cfg(test)]
 pub fn find_text(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
@@ -171,5 +201,17 @@ mod tests {
                 assert_eq!(is_key(s), key, "{:?}", s);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wraps_on_words_and_splits_overlong_ones() {
+        assert_eq!(wrap_text("aa bb cc", 5), ["aa bb", "cc"]);
+        assert_eq!(wrap_text("abcdefg", 3), ["abc", "def", "g"]);
+        assert_eq!(wrap_text("", 5), [""]);
     }
 }

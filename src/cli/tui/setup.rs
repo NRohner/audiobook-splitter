@@ -196,7 +196,9 @@ impl Setup {
             }
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(self.error.clone(), Style::new().fg(Color::Yellow)));
+        for row in super::hints::wrap_text(&self.error, inner.width as usize) {
+            lines.push(Line::styled(row, Style::new().fg(Color::Yellow)));
+        }
         lines.extend(wrap_hints(&[("Tab", "next"), ("Enter", "browse (path rows)"), ("Space", "toggle"), ("Ctrl-A", "analyze"), ("F1", "help"), ("Esc", "quit")], "   ", inner.width as usize));
         f.render_widget(Paragraph::new(lines), inner);
         match &mut self.browser {
@@ -249,6 +251,14 @@ mod tests {
         t.draw(|f| s.render(f, f.area())).unwrap();
         let buf = t.backend().buffer();
         (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn a_long_warning_wraps_instead_of_being_cut_off() {
+        let mut s = Setup::new(None);
+        s.error = "Whisper model 'ggml-base.en.bin' not found. Download it in the Models folder.".into();
+        let screen = screen_of(&mut s, 50, 24);
+        assert!(screen.contains("Models folder."), "{}", screen);
     }
 
     #[test]

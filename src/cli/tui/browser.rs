@@ -85,6 +85,7 @@ pub struct Browser {
     filter: String,
     filtering: bool,
     typed: Option<Input>,
+    naming: Option<Input>,
     selected: usize,
     state: ListState,
     pub(super) error: String,
@@ -113,6 +114,7 @@ impl Browser {
             filter: String::new(),
             filtering: false,
             typed: None,
+            naming: None,
             selected: 0,
             state: ListState::default(),
             error: String::new(),
@@ -169,6 +171,10 @@ impl Browser {
         if self.typed.is_some() {
             return self.key_typed(key);
         }
+        if self.naming.is_some() {
+            self.key_naming(key);
+            return BrowserOutcome::Continue;
+        }
         self.error.clear();
         if self.filtering {
             self.key_filter(key);
@@ -212,6 +218,7 @@ impl Browser {
                 self.typed = Some(Input::new(&start));
                 self.error.clear();
             }
+            KeyCode::Char('n') if matches!(self.pick, Pick::Folder) => self.naming = Some(Input::new("")),
             KeyCode::Char(' ') if self.pick.folders_pickable() => return BrowserOutcome::Chosen(self.dir.clone()),
             _ => {}
         }
@@ -236,6 +243,32 @@ impl Browser {
         }
         if self.filter != before {
             self.selected = 0;
+        }
+    }
+
+    // Names a new folder inside the current one; Enter creates it and selects it.
+    fn key_naming(&mut self, key: KeyEvent) {
+        let Some(input) = self.naming.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => self.naming = None,
+            KeyCode::Enter => {
+                let name = input.value().trim().to_string();
+                if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
+                    self.error = "A folder name can't be empty or contain a path separator.".into();
+                    return;
+                }
+                match std::fs::create_dir(self.dir.join(&name)) {
+                    Ok(()) => {
+                        self.naming = None;
+                        self.reload(Some(&name));
+                    }
+                    Err(e) => self.error = format!("Can't create '{}': {}", name, e),
+                }
+            }
+            _ => {
+                self.error.clear();
+                input.handle_key(key);
+            }
         }
     }
 
@@ -277,7 +310,7 @@ impl Browser {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let pairs: &[(&str, &str)] = match self.pick {
-            Pick::Folder => &[("Enter", "open"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
+            Pick::Folder => &[("Enter", "open"), ("Space", "choose this folder"), ("n", "new folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
             Pick::File(_) => &[("Enter", "open or pick"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
             Pick::FileOrFolder(_) => &[("Enter", "open or pick"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
         };
@@ -293,6 +326,12 @@ impl Browser {
                 let (text, col) = input.view(path_row.width.saturating_sub(7) as usize);
                 cursor = Some((path_row.x + 6 + col as u16, path_row.y));
                 format!("Path: {}", text)
+            }
+            None if self.naming.is_some() => {
+                let input = self.naming.as_ref().unwrap();
+                let (text, col) = input.view(path_row.width.saturating_sub(13) as usize);
+                cursor = Some((path_row.x + 12 + col as u16, path_row.y));
+                format!("New folder: {}", text)
             }
             None if self.filtering || !self.filter.is_empty() => format!("Filter: {}  ({})", self.filter, self.dir.display()),
             None => self.dir.display().to_string(),
@@ -411,6 +450,35 @@ mod tests {
         b.handle_key(k(KeyCode::Esc));
         assert_eq!(b.selected_name().as_deref(), Some("A"), "Esc clears the filter");
         assert!(matches!(b.handle_key(k(KeyCode::Esc)), BrowserOutcome::Cancel));
+    }
+
+    #[test]
+    fn n_creates_a_folder_in_the_folder_picker_and_selects_it() {
+        let dir = tree("newdir");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), Pick::Folder);
+        b.handle_key(ch('n'));
+        for c in "Fresh".chars() {
+            b.handle_key(ch(c));
+        }
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue));
+        assert!(dir.join("Fresh").is_dir());
+        assert_eq!(b.selected_name().as_deref(), Some("Fresh"));
+        // a duplicate or a path-like name is refused and the prompt stays open
+        for bad in ["Fresh", "a/b", ""] {
+            b.handle_key(ch('n'));
+            for c in bad.chars() {
+                b.handle_key(ch(c));
+            }
+            b.handle_key(k(KeyCode::Enter));
+            assert!(!b.error.is_empty(), "{:?}", bad);
+            b.handle_key(k(KeyCode::Esc));
+        }
+        assert!(matches!(b.handle_key(k(KeyCode::Esc)), BrowserOutcome::Cancel), "Esc closed the prompt first");
+        let mut files = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        files.handle_key(ch('n'));
+        files.handle_key(ch('x'));
+        files.handle_key(k(KeyCode::Enter));
+        assert!(!dir.join("x").exists(), "n does nothing in a file picker");
     }
 
     #[test]
