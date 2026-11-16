@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
-use super::super::hints::{key_style, wrap_hints};
+use super::super::hints::{hint_spans, key_style, wrap_hints};
 
 const HELP: &[(&str, &str)] = &[
     ("j/k, arrows, Pg, Home/End", "move the selection"),
@@ -13,7 +13,7 @@ const HELP: &[(&str, &str)] = &[
     ("[  ]", "move break to prev/next silence"),
     ("d", "remove the chapter"),
     ("a / n", "add at a time / at a silence"),
-    ("m", "chapters the EPUB match missed"),
+    ("m / R", "missed chapters / re-scan them"),
     ("t", "tags, file naming and cover art"),
     ("g", "jump to a time (1:02:03) or a chapter number"),
     ("p", "write a preview clip of the selected break"),
@@ -66,7 +66,16 @@ impl Editor {
                 Row::new(vec![format!("{}{}", i + 1, fixed), place(&self.plan, b.file, b.at), b.title.clone(), score])
             })
             .collect();
-        let title = format!(" Chapters ({}){} ", rows.len(), if self.changed() { " *" } else { "" });
+        let mut title = vec![Span::raw(format!(" Chapters ({}){}", rows.len(), if self.changed() { " *" } else { "" }))];
+        let missing = self.plan.findings.missing.len();
+        if missing > 0 {
+            title.push(Span::raw("  "));
+            title.push(Span::styled(format!("{} not found", missing), Style::new().fg(Color::Yellow)));
+            title.push(Span::raw(" - press "));
+            title.push(Span::styled("m", key_style()));
+        }
+        title.push(Span::raw(" "));
+        let title = Line::from(title);
         let table = Table::new(rows, [Constraint::Length(5), Constraint::Length(where_w), Constraint::Fill(1), Constraint::Length(5)])
             .header(Row::new(vec!["#", "Where", "Title", "Match"]).style(Style::new().add_modifier(Modifier::BOLD)))
             .block(Block::bordered().title(title))
@@ -108,7 +117,12 @@ impl Editor {
 
     fn footer_keys(&self, width: usize) -> Vec<Line<'static>> {
         let v = self.finish_verb();
-        wrap_hints(&[("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing"), ("t", "tags"), ("g", "jump"), ("p", "preview"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")], "  ", width)
+        let mut pairs = vec![("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing")];
+        if !self.plan.findings.missing.is_empty() {
+            pairs.push(("R", "re-scan missing"));
+        }
+        pairs.extend([("t", "tags"), ("g", "jump"), ("p", "preview"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")]);
+        wrap_hints(&pairs, "  ", width)
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect, mut lines: Vec<Line<'static>>) {
@@ -137,13 +151,18 @@ impl Editor {
                 let title = match kind {
                     ListKind::AddFile => " Which file? ",
                     ListKind::Silence { .. } => " Start a chapter at ",
-                    ListKind::Missing => " Chapters with no break (Enter: choose a silence) ",
+                    ListKind::Missing => " Chapters with no break ",
                 };
                 let rect = centered(area, 70, (items.len().min(u16::MAX as usize - 2) as u16).saturating_add(2).min(area.height.saturating_sub(2)).max(3));
                 let mut state = ListState::default();
                 state.select(Some(*selected));
+                let mut block = Block::bordered().title(title);
+                if matches!(kind, ListKind::Missing) {
+                    let hints = [("Enter", "place by hand"), ("R", "re-scan"), ("A", "re-scan all"), ("Esc", "close")];
+                    block = block.title_bottom(Line::from(hint_spans(&hints)));
+                }
                 let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
-                    .block(Block::bordered().title(title))
+                    .block(block)
                     .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
                     .highlight_symbol(">");
                 f.render_widget(Clear, rect);
@@ -420,6 +439,66 @@ mod tests {
         let r = rows(&mut ed, 40, 15);
         for want in ["s save and continue", "d discard", "Esc keep editing"] {
             assert!(r.iter().any(|l| l.contains(want)), "{:?} not whole:\n{}", want, r.join("\n"));
+        }
+    }
+
+    fn plan_missing(n: usize) -> Editor {
+        let mut p = sample_plan();
+        p.epub = Some("book.epub".into());
+        for i in 0..n {
+            p.findings.missing.push(audiobook_splitter_rust::plan::Missing { chapter: 3 + i, title: format!("Lost {}", i), tried: false });
+        }
+        Editor::new(p)
+    }
+
+    #[test]
+    fn the_table_title_counts_the_missing_chapters_in_yellow() {
+        let mut ed = plan_missing(2);
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("Chapters (3)  2 not found - press m"), "{}", screen);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| ed.render(f)).unwrap();
+        let buf = t.backend().buffer();
+        let (x, y) = crate::cli::tui::hints::find_text(buf, "2 not found").unwrap();
+        assert_eq!(buf[(x, y)].style().fg, Some(Color::Yellow));
+        let row0: String = (0..80).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        let at = row0.chars().count() - row0.split("press m").nth(1).unwrap().chars().count() - 1;
+        assert_eq!(buf[(at as u16, 0)].style().fg, Some(Color::Cyan), "the m is a key");
+        let mut none = Editor::new(sample_plan());
+        assert!(!draw(&mut none, 80, 24).contains("not found"));
+        let mut ed = plan_missing(1);
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        assert!(draw(&mut ed, 80, 24).contains("Chapters (3) *  1 not found"), "marker and count together");
+    }
+
+    #[test]
+    fn the_missing_popup_shows_its_key_hints_at_80x24_and_60x15() {
+        for (w, h) in [(80, 24), (60, 15), (40, 8)] {
+            let mut ed = plan_missing(2);
+            ed.handle_key(k('m'));
+            let screen = draw(&mut ed, w, h);
+            if w >= 60 {
+                for want in ["Enter place", "R re-scan", "A re-scan all", "Esc close"] {
+                    assert!(screen.contains(want), "missing {:?} at {}x{}:\n{}", want, w, h, screen);
+                }
+                assert!(screen.contains("Lost 0") || h < 24, "{}", screen);
+            }
+        }
+    }
+
+    #[test]
+    fn the_footer_and_help_name_the_rescan_key_only_where_it_applies() {
+        let mut ed = plan_missing(1);
+        assert!(draw(&mut ed, 80, 24).contains("R re-scan missing"));
+        let mut none = Editor::new(sample_plan());
+        assert!(!draw(&mut none, 80, 24).contains("re-scan missing"));
+        let mut ed = plan_missing(1);
+        ed.handle_key(k('?'));
+        let screen = draw(&mut ed, 60, 15);
+        assert!(screen.contains("re-scan"), "{}", screen);
+        for want in ["undo", "jump", "back to Setup", "quit", "move break to prev/next silence"] {
+            assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
         }
     }
 }

@@ -10,12 +10,12 @@ pub mod setup;
 pub mod tags;
 pub mod terminal;
 
-use audiobook_splitter_rust::plan::Plan;
+use audiobook_splitter_rust::plan::{Findings, Plan};
 use editor::{Editor, Outcome};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use terminal::TerminalGuard;
 use super::{check_tools, open_cache, open_plan};
-use audiobook_splitter_rust::pipeline::{self, analyze, default_metadata, file_name, open_epub, prepare_split, write_tracks, SplitReport};
+use audiobook_splitter_rust::pipeline::{self, analyze, chapter_title, default_metadata, file_name, open_epub, prepare_split, rescan_one, write_tracks, LazyTranscriber, SplitReport};
 use audiobook_splitter_rust::user_path;
 use browser::{Browser, BrowserOutcome, Pick};
 use jobs::{Job, Msg};
@@ -50,7 +50,45 @@ enum Screen {
     Editor(Box<Editor>),
     PickOutput { editor: Box<Editor>, browser: Browser },
     Splitting { progress: Progress, job: Job<SplitReport> },
+    Rescanning { editor: Box<Editor>, progress: Progress, job: Job<RescanResult> },
     Done(DoneInfo),
+}
+
+// What a re-scan job hands back: the findings with every result folded in, how many missing
+// chapters it looked for and found, and why it stopped early, if it did.
+pub struct RescanResult {
+    findings: Findings,
+    asked: usize,
+    found: usize,
+    error: Option<String>,
+}
+
+// Re-scans each of `chapters` (sorted, no repeats, only those still missing) one at a time. Each
+// result is folded into the findings before the next chapter, so the next search window uses the
+// updated `found` list. An error stops the loop but keeps what was found so far.
+fn run_rescan(
+    mut chapters: Vec<usize>,
+    mut findings: Findings,
+    title: impl Fn(usize) -> String,
+    mut rescan: impl FnMut(usize, &Findings) -> Result<pipeline::Rescan, String>,
+) -> RescanResult {
+    chapters.sort_unstable();
+    chapters.dedup();
+    chapters.retain(|c| findings.missing.iter().any(|m| m.chapter == *c));
+    let (asked, mut found, mut error) = (chapters.len(), 0, None);
+    for ch in chapters {
+        match rescan(ch, &findings) {
+            Ok(r) => {
+                found += r.found.is_some() as usize;
+                findings.apply_rescan(ch, title(ch), r.found, r.silences);
+            }
+            Err(e) => {
+                error = Some(e);
+                break;
+            }
+        }
+    }
+    RescanResult { findings, asked, found, error }
 }
 
 // Built once per job and moved straight on, so the size difference costs nothing.
@@ -58,6 +96,7 @@ enum Screen {
 enum Finished {
     Analysis(Result<Plan, String>),
     Split(Result<SplitReport, String>),
+    Rescan(Result<RescanResult, String>),
 }
 
 // The whole terminal app: one screen at a time, the Setup form kept across screens so `b`
@@ -72,6 +111,8 @@ pub struct App {
     quit: bool,
     // Why the plan could not be saved when the split started; shown on the Done screen.
     plan_error: Option<String>,
+    // Whether the cache is on (the Setup choice), for re-scans started from the editor.
+    use_cache: bool,
 }
 
 fn is_plan_path(path: &Path) -> bool {
@@ -102,6 +143,7 @@ impl App {
                 help: false,
                 quit: false,
                 plan_error: None,
+                use_cache: true,
             }),
         }
     }
@@ -110,7 +152,7 @@ impl App {
     pub fn with_plan(plan: Plan, plan_path: Option<PathBuf>) -> App {
         let mut editor = Editor::new(plan);
         editor.allow_back = true;
-        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, help: false, quit: false, plan_error: None }
+        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, help: false, quit: false, plan_error: None, use_cache: true }
     }
 
     pub fn is_over(&self) -> bool {
@@ -129,6 +171,7 @@ impl App {
             None => (None, default_metadata(None)),
         };
         let cache = open_cache(!req.use_cache);
+        self.use_cache = req.use_cache;
         let AnalyzeRequest { inputs, epub: epub_path, out, settings, .. } = req;
         self.plan_path = Some(out.join("plan.json"));
         self.out = Some(out);
@@ -144,6 +187,35 @@ impl App {
         });
         self.screen = Screen::Analyzing { progress: Progress::new("Analyzing"), job };
         Ok(())
+    }
+
+    // Fails fast (missing tools, unreadable EPUB) back in the editor, then re-scans the missing
+    // `chapters` one by one on a worker thread.
+    fn start_rescan(&mut self, mut editor: Box<Editor>, chapters: Vec<usize>) {
+        let prepared = check_tools().and_then(|_| match editor.plan.epub.clone() {
+            Some(path) => open_epub(&path).map(|(epub, _)| epub),
+            None => Err("This plan was made without an EPUB, so there is nothing to re-scan against.".to_string()),
+        });
+        let epub = match prepared {
+            Ok(epub) => epub,
+            Err(e) => {
+                editor.set_status(e);
+                self.screen = Screen::Editor(editor);
+                return;
+            }
+        };
+        let (files, findings, settings) = (editor.plan.files.clone(), editor.plan.findings.clone(), editor.plan.settings.clone());
+        let cache = open_cache(!self.use_cache);
+        let job = Job::spawn(move |emit| {
+            let mut transcriber = LazyTranscriber::new(&epub.model);
+            Ok(run_rescan(
+                chapters,
+                findings,
+                |ch| chapter_title(&epub.chapters, ch),
+                |ch, f| rescan_one(ch, &files, &f.found, &settings, &epub, &mut transcriber, &cache, emit),
+            ))
+        });
+        self.screen = Screen::Rescanning { editor, progress: Progress::new("Re-scanning"), job };
     }
 
     // Validates the split before anything is written, saves the plan, then writes the files on a worker thread.
@@ -176,6 +248,7 @@ impl App {
         let finished = match &mut self.screen {
             Screen::Analyzing { progress, job } => drain(job, progress).map(Finished::Analysis),
             Screen::Splitting { progress, job } => drain(job, progress).map(Finished::Split),
+            Screen::Rescanning { progress, job, .. } => drain(job, progress).map(Finished::Rescan),
             _ => None,
         };
         match finished {
@@ -217,6 +290,17 @@ impl App {
                 self.help = false;
                 self.screen = Screen::Done(info);
             }
+            Some(Finished::Rescan(result)) => {
+                if let Screen::Rescanning { mut editor, .. } = std::mem::replace(&mut self.screen, Screen::Setup) {
+                    match result {
+                        Ok(r) => editor.apply_rescan(r.findings, r.asked, r.found, r.error),
+                        Err(e) => editor.set_status(format!("The re-scan failed: {}", e)),
+                    }
+                    self.confirm_quit = false;
+                    self.help = false;
+                    self.screen = Screen::Editor(editor);
+                }
+            }
             None => {}
         }
     }
@@ -233,7 +317,7 @@ impl App {
             self.help = false;
             return;
         }
-        if key.code == KeyCode::Char('?') && matches!(self.screen, Screen::Analyzing { .. } | Screen::Splitting { .. } | Screen::Done(_)) {
+        if key.code == KeyCode::Char('?') && matches!(self.screen, Screen::Analyzing { .. } | Screen::Splitting { .. } | Screen::Rescanning { .. } | Screen::Done(_)) {
             self.help = true;
             return;
         }
@@ -248,7 +332,7 @@ impl App {
                     }
                 }
             },
-            screen @ (Screen::Analyzing { .. } | Screen::Splitting { .. }) => {
+            screen @ (Screen::Analyzing { .. } | Screen::Splitting { .. } | Screen::Rescanning { .. }) => {
                 self.screen = screen;
                 if ctrl_c || key.code == KeyCode::Char('q') {
                     self.confirm_quit = true;
@@ -258,6 +342,7 @@ impl App {
                 Outcome::Continue => self.screen = Screen::Editor(editor),
                 Outcome::Discard => self.quit = true,
                 Outcome::Back => self.screen = Screen::Setup,
+                Outcome::Rescan(chapters) => self.start_rescan(editor, chapters),
                 Outcome::Save => match self.out.clone() {
                     Some(out) => self.start_split(editor, out),
                     None => {
@@ -287,7 +372,7 @@ impl App {
         let area = f.area();
         match &mut self.screen {
             Screen::Setup => self.setup.render(f, area),
-            Screen::Analyzing { progress, .. } | Screen::Splitting { progress, .. } => progress.render(f, area),
+            Screen::Analyzing { progress, .. } | Screen::Splitting { progress, .. } | Screen::Rescanning { progress, .. } => progress.render(f, area),
             Screen::Editor(editor) => editor.render(f),
             Screen::PickOutput { editor, browser } => {
                 editor.render(f);
@@ -380,7 +465,7 @@ pub fn edit(plan: &mut Plan, mut guard: TerminalGuard) -> Result<bool, String> {
         guard.terminal.draw(|f| ed.render(f)).map_err(|e| e.to_string())?;
         match event::read().map_err(|e| e.to_string())? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match ed.handle_key(key) {
-                Outcome::Continue | Outcome::Back => {}
+                Outcome::Continue | Outcome::Back | Outcome::Rescan(_) => {}
                 done => break done,
             },
             _ => {} // Resize and the rest: just redraw.
@@ -792,5 +877,133 @@ mod tests {
     fn a_json_argument_is_a_plan_and_anything_else_a_book() {
         assert!(is_plan_path(Path::new("plan.json")) && is_plan_path(Path::new("/x/Plan.JSON")));
         assert!(!is_plan_path(Path::new("book.mp3")) && !is_plan_path(Path::new("/books/folder")));
+    }
+
+    use audiobook_splitter_rust::chapters::ChapterBreak;
+    use audiobook_splitter_rust::plan::{Findings, Missing};
+
+    fn hit(chapter: usize, at: f64) -> ChapterBreak {
+        ChapterBreak { file: 0, at, chapter, score: 1.5, before: String::new(), after: String::new() }
+    }
+
+    fn missing_findings(chapters: &[usize]) -> Findings {
+        let mut f = sample_plan().findings;
+        f.found = vec![hit(0, 0.0), hit(1, 30.0), hit(2, 60.0)];
+        f.missing = chapters.iter().map(|&c| Missing { chapter: c, title: format!("Ch {}", c), tried: false }).collect();
+        f
+    }
+
+    #[test]
+    fn run_rescan_goes_through_the_chapters_in_order_and_each_sees_the_earlier_finds() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let result = run_rescan(vec![5, 3, 5, 9, 4], missing_findings(&[3, 4, 5]), |c| format!("Ch {}", c), |ch, f| {
+            calls.borrow_mut().push((ch, f.found.len()));
+            Ok(pipeline::Rescan { found: (ch != 4).then(|| hit(ch, 40.0 + ch as f64)), silences: vec![] })
+        });
+        assert_eq!(*calls.borrow(), [(3, 3), (4, 4), (5, 4)], "sorted, deduplicated, never the non-missing 9; `found` grows after a hit");
+        assert_eq!((result.asked, result.found, result.error), (3, 2, None));
+        assert_eq!(result.findings.missing.iter().map(|m| (m.chapter, m.tried)).collect::<Vec<_>>(), [(4, true)]);
+        assert_eq!(result.findings.breaks.iter().filter(|b| b.title.starts_with("Ch ")).count(), 2);
+    }
+
+    #[test]
+    fn run_rescan_keeps_the_first_result_when_the_second_chapter_errors() {
+        let result = run_rescan(vec![3, 4, 5], missing_findings(&[3, 4, 5]), |c| format!("Ch {}", c), |ch, _| {
+            if ch == 4 { Err("whisper broke".into()) } else { Ok(pipeline::Rescan { found: Some(hit(ch, 45.0)), silences: vec![] }) }
+        });
+        assert_eq!((result.asked, result.found), (3, 1));
+        assert_eq!(result.error.as_deref(), Some("whisper broke"));
+        assert_eq!(result.findings.missing.iter().map(|m| m.chapter).collect::<Vec<_>>(), [4, 5]);
+        assert!(result.findings.breaks.iter().any(|b| b.title == "Ch 3"));
+    }
+
+    fn rescan_editor() -> Editor {
+        let mut p = sample_plan();
+        p.epub = Some("book.epub".into());
+        p.findings = missing_findings(&[3, 4]);
+        let mut ed = Editor::new(p);
+        ed.allow_back = true;
+        ed
+    }
+
+    fn rescanning_app(ed: Editor) -> (App, std::sync::mpsc::Sender<jobs::Msg<RescanResult>>) {
+        let mut app = App::new(None).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Rescanning { editor: Box::new(ed), progress: progress::Progress::new("Re-scanning"), job: jobs::Job::from_receiver(rx) };
+        (app, tx)
+    }
+
+    #[test]
+    fn a_finished_rescan_returns_to_the_editor_with_the_new_chapter_selected() {
+        let ed = rescan_editor();
+        let result = run_rescan(vec![3, 4], ed.plan.findings.clone(), |c| format!("Ch {}", c), |ch, _| {
+            Ok(pipeline::Rescan { found: (ch == 3).then(|| hit(3, 45.0)), silences: vec![] })
+        });
+        let (mut app, tx) = rescanning_app(ed);
+        assert!(draw(&mut app, 80, 24).contains("Re-scanning"));
+        app.handle_key(ch('?'));
+        assert!(draw(&mut app, 80, 24).contains("Ctrl-c"));
+        app.handle_key(ch('x'));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.confirm_quit && !app.is_over());
+        tx.send(jobs::Msg::Done(Ok(result))).unwrap();
+        app.tick();
+        assert!(!app.confirm_quit && !app.help);
+        let Screen::Editor(ed) = &app.screen else { panic!("expected the editor") };
+        assert_eq!(ed.plan.findings.breaks.iter().map(|b| b.title.as_str()).collect::<Vec<_>>(), ["One", "Two", "Ch 3", "Three"]);
+        assert_eq!(ed.selected, 2);
+        assert!(draw(&mut app, 100, 24).contains("Found 1 of 2 missing chapters; 1 still missing."));
+    }
+
+    #[test]
+    fn ctrl_c_during_a_rescan_asks_first() {
+        let (mut app, _tx) = rescanning_app(rescan_editor());
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.is_over() && draw(&mut app, 80, 24).contains("Quit"));
+        app.handle_key(ch('n'));
+        assert!(matches!(app.screen, Screen::Rescanning { .. }));
+        app.handle_key(ch('q'));
+        app.handle_key(ch('y'));
+        assert!(app.is_over());
+    }
+
+    #[test]
+    fn a_failed_rescan_returns_to_the_editor_with_the_error_and_the_partial_results() {
+        let ed = rescan_editor();
+        let result = run_rescan(vec![3, 4], ed.plan.findings.clone(), |c| format!("Ch {}", c), |ch, _| {
+            if ch == 4 { Err("ffmpeg died".into()) } else { Ok(pipeline::Rescan { found: Some(hit(3, 45.0)), silences: vec![] }) }
+        });
+        let (mut app, tx) = rescanning_app(ed);
+        tx.send(jobs::Msg::Done(Ok(result))).unwrap();
+        app.tick();
+        let Screen::Editor(ed) = &app.screen else { panic!("expected the editor") };
+        assert_eq!(ed.plan.findings.breaks.len(), 4, "the found chapter is kept");
+        let screen = draw(&mut app, 120, 24);
+        assert!(screen.contains("Stopped early: ffmpeg died"), "{}", screen);
+        let (mut app, tx) = rescanning_app(rescan_editor());
+        tx.send(jobs::Msg::Done(Err("The background job crashed: x".into()))).unwrap();
+        app.tick();
+        assert!(in_editor(&app) && draw(&mut app, 100, 24).contains("crashed"));
+    }
+
+    #[test]
+    fn a_rescan_request_without_an_epub_never_leaves_the_editor() {
+        let mut ed = rescan_editor();
+        ed.plan.epub = None;
+        let mut app = App { screen: Screen::Editor(Box::new(ed)), ..App::new(None).unwrap() };
+        app.handle_key(ch('R'));
+        assert!(in_editor(&app));
+        assert!(draw(&mut app, 100, 24).contains("without an EPUB"));
+    }
+
+    #[test]
+    fn a_rescan_with_an_unreadable_epub_fails_before_starting_and_says_why() {
+        let mut ed = rescan_editor();
+        ed.plan.epub = Some("/nonexistent/book.epub".into());
+        let mut app = App { screen: Screen::Editor(Box::new(ed)), ..App::new(None).unwrap() };
+        app.handle_key(ch('R'));
+        assert!(in_editor(&app), "no job was started");
+        let Screen::Editor(ed) = &app.screen else { unreachable!() };
+        assert!(!ed.status.is_empty());
     }
 }

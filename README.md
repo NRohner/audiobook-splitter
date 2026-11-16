@@ -187,7 +187,8 @@ Editor keys (`?` shows them in the app):
 | `d` | Remove the chapter |
 | `a` | Add a chapter at a time |
 | `n` | Add a chapter at a silence |
-| `m` | Chapters the EPUB match missed |
+| `m` | List the chapters the EPUB match missed (the table title shows how many); in the list Enter picks a silence to place one by hand, `R` re-scans the highlighted chapter and `A` re-scans all of them |
+| `R` | Re-scan all missing chapters (`tui` only, needs the plan's EPUB) |
 | `t` | Tags, file naming and cover art |
 | `g` | Jump to a time (`1:02:03`) or a chapter number |
 | `p` | Write a preview clip of the selected break |
@@ -196,6 +197,8 @@ Editor keys (`?` shows them in the app):
 | `q`, Ctrl-c | Quit (asks if there are unsaved changes) |
 | `b` | Back to Setup (`tui` only) |
 | `?` | Help |
+
+A re-scan searches only the stretch between the nearest found chapters either side of each missing chapter, with a shorter minimum silence and a higher noise threshold, and runs one chapter at a time on the progress screen. It is one undo step, selects the first chapter it found and needs Whisper, like `rescan`.
 
 Cover art is chosen in the tags form: keep the embedded cover, use none, or use an image (Ctrl-B on the image row opens the file browser for a JPEG or PNG).
 

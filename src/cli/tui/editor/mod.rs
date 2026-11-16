@@ -13,7 +13,8 @@ use crate::cli::time::{clock, parse_time};
 use crate::cli::place;
 use audiobook_splitter_rust::meta::Metadata;
 use audiobook_splitter_rust::pipeline::file_name;
-use audiobook_splitter_rust::plan::{Plan, PlanBreak};
+use audiobook_splitter_rust::chapters::ChapterBreak;
+use audiobook_splitter_rust::plan::{Findings, Missing, Plan, PlanBreak, PlanSilence};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
@@ -24,6 +25,16 @@ pub enum Outcome {
     Save,
     Discard,
     Back, // Only when `allow_back` is set: return to the Setup screen.
+    Rescan(Vec<usize>), // Only in the `tui` app with an EPUB: re-scan these EPUB chapters (sorted, no repeats).
+}
+
+// What a re-scan changes besides the breaks. Only the snapshots on either side of a re-scan carry it,
+// so ordinary edits never copy the (large) silence list.
+#[derive(Clone)]
+struct Scan {
+    missing: Vec<Missing>,
+    silences: Vec<PlanSilence>,
+    found: Vec<ChapterBreak>,
 }
 
 #[derive(Clone)]
@@ -31,6 +42,7 @@ struct Snapshot {
     breaks: Vec<PlanBreak>,
     metadata: Metadata,
     selected: usize,
+    scan: Option<Scan>,
 }
 
 pub(super) enum Prompt {
@@ -109,11 +121,18 @@ impl Editor {
         ops::changed(&self.plan, &self.original)
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot { breaks: self.plan.findings.breaks.clone(), metadata: self.plan.metadata.clone(), selected: self.selected }
+    fn snapshot(&self, with_scan: bool) -> Snapshot {
+        let f = &self.plan.findings;
+        let scan = with_scan.then(|| Scan { missing: f.missing.clone(), silences: f.silences.clone(), found: f.found.clone() });
+        Snapshot { breaks: f.breaks.clone(), metadata: self.plan.metadata.clone(), selected: self.selected, scan }
     }
 
     fn restore(&mut self, s: Snapshot) {
+        if let Some(scan) = s.scan {
+            self.plan.findings.missing = scan.missing;
+            self.plan.findings.silences = scan.silences;
+            self.plan.findings.found = scan.found;
+        }
         self.plan.findings.breaks = s.breaks;
         self.plan.metadata = s.metadata;
         self.selected = s.selected;
@@ -125,7 +144,12 @@ impl Editor {
 
     // Runs one change; on success it becomes undoable, on refusal the plan is put back as it was.
     fn apply(&mut self, change: impl FnOnce(&mut Plan) -> Result<(), String>) -> Result<(), String> {
-        let before = self.snapshot();
+        self.apply_with(false, change)
+    }
+
+    // `with_scan`: the change also touches the missing/silences/found findings (a re-scan).
+    fn apply_with(&mut self, with_scan: bool, change: impl FnOnce(&mut Plan) -> Result<(), String>) -> Result<(), String> {
+        let before = self.snapshot(with_scan);
         match change(&mut self.plan) {
             Ok(()) => {
                 self.undo.push(before);
@@ -150,7 +174,7 @@ impl Editor {
     fn undo(&mut self) {
         match self.undo.pop() {
             Some(prev) => {
-                let now = self.snapshot();
+                let now = self.snapshot(prev.scan.is_some());
                 self.redo.push(now);
                 self.restore(prev);
                 self.status = "Undone.".into();
@@ -162,13 +186,63 @@ impl Editor {
     fn redo(&mut self) {
         match self.redo.pop() {
             Some(next) => {
-                let now = self.snapshot();
+                let now = self.snapshot(next.scan.is_some());
                 self.undo.push(now);
                 self.restore(next);
                 self.status = "Redone.".into();
             }
             None => self.status = "Nothing to redo.".into(),
         }
+    }
+
+    // Folds a finished re-scan in as one undo step: `findings` is the plan's findings with the
+    // results applied. The first newly found chapter is selected and the status line says what happened.
+    pub fn apply_rescan(&mut self, findings: Findings, asked: usize, found: usize, error: Option<String>) {
+        let old: Vec<(usize, f64)> = self.plan.findings.breaks.iter().map(|b| (b.file, b.at)).collect();
+        let _ = self.apply_with(true, |p| {
+            p.findings = findings;
+            p.sort_breaks();
+            Ok(())
+        });
+        if let Some(i) = self.plan.findings.breaks.iter().position(|b| !old.iter().any(|&o| ops::same(o, (b.file, b.at)))) {
+            self.selected = i;
+        }
+        let still = self.plan.findings.missing.len();
+        let mut status = if found == 0 {
+            format!("No match found for the {} missing chapters (a re-scan can't do more with these settings).", asked)
+        } else if found >= asked {
+            format!("Found {} of {} missing chapters.", found, asked)
+        } else {
+            format!("Found {} of {} missing chapters; {} still missing.", found, asked, still)
+        };
+        if let Some(e) = error {
+            status.push_str(&format!(" Stopped early: {}", e));
+        }
+        self.status = status;
+    }
+
+    // The EPUB chapter numbers to re-scan become an outcome only where the app can run the job.
+    fn request_rescan(&mut self, mut chapters: Vec<usize>) -> Outcome {
+        chapters.sort_unstable();
+        chapters.dedup();
+        if self.plan.epub.is_none() {
+            self.status = "This plan was made without an EPUB, so there is nothing to re-scan against.".into();
+            Outcome::Continue
+        } else if !self.allow_back {
+            self.status = "Re-scan runs in `tui` or with the `rescan` command.".into();
+            Outcome::Continue
+        } else {
+            Outcome::Rescan(chapters)
+        }
+    }
+
+    fn rescan_all(&mut self) -> Outcome {
+        if self.plan.findings.missing.is_empty() {
+            self.status = "No chapters are missing.".into();
+            return Outcome::Continue;
+        }
+        let all = self.plan.findings.missing.iter().map(|m| m.chapter).collect();
+        self.request_rescan(all)
     }
 
     fn select_pos(&mut self, at: Pos) {
@@ -214,6 +288,7 @@ impl Editor {
             KeyCode::Char('a') => self.open_add(),
             KeyCode::Char('n') => self.open_silences(None),
             KeyCode::Char('m') => self.open_missing(),
+            KeyCode::Char('R') => return self.rescan_all(),
             KeyCode::Char('t') => self.open_tags(tags::find_embedded_name),
             KeyCode::Char('g') => self.mode = Mode::Prompt { kind: Prompt::Jump, input: Input::new("") },
             KeyCode::Char('p') => {
@@ -383,6 +458,13 @@ impl Editor {
                 self.choose(kind, selected);
                 return Outcome::Continue;
             }
+            KeyCode::Char('R') if matches!(kind, ListKind::Missing) => {
+                return match self.plan.findings.missing.get(selected) {
+                    Some(m) => self.request_rescan(vec![m.chapter]),
+                    None => Outcome::Continue,
+                };
+            }
+            KeyCode::Char('A') if matches!(kind, ListKind::Missing) => return self.rescan_all(),
             _ => {}
         }
         self.mode = Mode::List { kind, items, selected };
@@ -744,5 +826,150 @@ mod tests {
         ed.handle_key(k(KeyCode::Esc));
         assert!(matches!(ed.mode, Mode::Normal));
         assert!(!ed.changed());
+    }
+
+    // A plan from an EPUB match with chapters 5 and 4 (numbers 5 and 4 in the book) missing, in that order.
+    fn missing_editor() -> Editor {
+        use audiobook_splitter_rust::chapters::ChapterBreak;
+        let mut p = sample_plan();
+        p.epub = Some("book.epub".into());
+        p.findings.missing = vec![Missing { chapter: 4, title: "Five".into(), tried: false }, Missing { chapter: 3, title: "Four".into(), tried: false }];
+        p.findings.found = (0..3).map(|c| ChapterBreak { file: 0, at: c as f64 * 30.0, chapter: c, score: 1.0, before: String::new(), after: String::new() }).collect();
+        let mut ed = Editor::new(p);
+        ed.allow_back = true;
+        ed
+    }
+
+    fn rescan_of(o: Outcome) -> Vec<usize> {
+        match o {
+            Outcome::Rescan(v) => v,
+            _ => panic!("expected a re-scan request"),
+        }
+    }
+
+    #[test]
+    fn r_in_the_missing_list_rescans_the_highlighted_chapter_and_a_rescans_all() {
+        let mut ed = missing_editor();
+        press(&mut ed, "m");
+        ed.handle_key(k(KeyCode::Down));
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('R')))), vec![3]);
+        assert!(matches!(ed.mode, Mode::Normal));
+        press(&mut ed, "m");
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('A')))), vec![3, 4], "sorted");
+        press(&mut ed, "m");
+        ed.handle_key(k(KeyCode::Enter));
+        assert!(matches!(ed.mode, Mode::List { kind: ListKind::Silence { .. }, .. }), "Enter still places by hand");
+    }
+
+    #[test]
+    fn capital_r_rescans_all_missing_and_lowercase_r_still_renames() {
+        let mut ed = missing_editor();
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('R')))), vec![3, 4]);
+        press(&mut ed, "r");
+        assert!(matches!(ed.mode, Mode::Prompt { kind: Prompt::Rename(_), .. }));
+        let mut plain = editor();
+        plain.handle_key(k(KeyCode::Char('R')));
+        assert_eq!(plain.status, "No chapters are missing.");
+        let mut ed = missing_editor();
+        press(&mut ed, "j]");
+        ed.handle_key(ctrl('r'));
+        assert_eq!(ed.status, "Nothing to redo.");
+        let mut ed = missing_editor();
+        ed.plan.findings.missing.push(Missing { chapter: 3, title: "Four again".into(), tried: true });
+        assert_eq!(rescan_of(ed.handle_key(k(KeyCode::Char('R')))), vec![3, 4], "deduplicated");
+    }
+
+    #[test]
+    fn rescan_stays_in_the_editor_without_an_epub_or_outside_the_app() {
+        let mut ed = missing_editor();
+        ed.plan.epub = None;
+        assert!(matches!(ed.handle_key(k(KeyCode::Char('R'))), Outcome::Continue));
+        assert_eq!(ed.status, "This plan was made without an EPUB, so there is nothing to re-scan against.");
+        let mut ed = missing_editor();
+        ed.allow_back = false;
+        assert!(matches!(ed.handle_key(k(KeyCode::Char('R'))), Outcome::Continue));
+        assert_eq!(ed.status, "Re-scan runs in `tui` or with the `rescan` command.");
+        press(&mut ed, "m");
+        assert!(matches!(ed.handle_key(k(KeyCode::Char('A'))), Outcome::Continue));
+        assert!(ed.status.contains("Re-scan runs in"));
+    }
+
+    // What a re-scan job hands back: chapter 4 found at 45 s, chapter 5 not.
+    fn rescanned(ed: &Editor) -> audiobook_splitter_rust::plan::Findings {
+        use audiobook_splitter_rust::chapters::ChapterBreak;
+        use audiobook_splitter_rust::plan::PlanSilence;
+        let mut f = ed.plan.findings.clone();
+        let hit = ChapterBreak { file: 0, at: 45.0, chapter: 3, score: 1.5, before: String::new(), after: String::new() };
+        f.apply_rescan(3, "Four".into(), Some(hit), vec![PlanSilence { file: 0, at: 44.0, before: "x".into(), after: "y".into() }]);
+        f.apply_rescan(4, "Five".into(), None, vec![]);
+        f
+    }
+
+    #[test]
+    fn apply_rescan_inserts_in_order_selects_the_first_new_chapter_and_marks_tried() {
+        let mut ed = missing_editor();
+        let f = rescanned(&ed);
+        ed.apply_rescan(f, 2, 1, None);
+        assert_eq!(titles(&ed), ["One", "Two", "Four", "Three"]);
+        assert_eq!(ed.selected, 2);
+        assert_eq!(ed.plan.findings.missing.len(), 1);
+        assert!(ed.plan.findings.missing[0].tried && ed.plan.findings.missing[0].chapter == 4);
+        assert_eq!(ed.status, "Found 1 of 2 missing chapters; 1 still missing.");
+        assert!(ed.changed());
+    }
+
+    #[test]
+    fn apply_rescan_status_texts() {
+        let mut ed = missing_editor();
+        ed.apply_rescan(ed.plan.findings.clone(), 2, 0, None);
+        assert_eq!(ed.status, "No match found for the 2 missing chapters (a re-scan can't do more with these settings).");
+        let mut ed = missing_editor();
+        ed.apply_rescan(ed.plan.findings.clone(), 2, 2, None);
+        assert_eq!(ed.status, "Found 2 of 2 missing chapters.");
+        let mut ed = missing_editor();
+        let f = rescanned(&ed);
+        ed.apply_rescan(f, 2, 1, Some("ffmpeg died".into()));
+        assert!(ed.status.ends_with(" Stopped early: ffmpeg died"), "{}", ed.status);
+        assert_eq!(titles(&ed).len(), 4, "what was found is kept");
+    }
+
+    #[test]
+    fn one_rescan_is_one_undo_step_covering_breaks_and_findings() {
+        let mut ed = missing_editor();
+        let (silences, found) = (ed.plan.findings.silences.len(), ed.plan.findings.found.len());
+        let f = rescanned(&ed);
+        ed.apply_rescan(f, 2, 1, None);
+        assert_eq!((ed.plan.findings.silences.len(), ed.plan.findings.found.len()), (silences + 1, found + 1));
+        press(&mut ed, "u");
+        assert_eq!(titles(&ed), ["One", "Two", "Three"]);
+        assert_eq!(ed.plan.findings.missing.iter().map(|m| (m.chapter, m.tried)).collect::<Vec<_>>(), [(4, false), (3, false)]);
+        assert_eq!((ed.plan.findings.silences.len(), ed.plan.findings.found.len()), (silences, found));
+        assert!(!ed.changed());
+        ed.handle_key(ctrl('r'));
+        assert_eq!(titles(&ed), ["One", "Two", "Four", "Three"]);
+        assert_eq!(ed.plan.findings.missing.len(), 1);
+        assert_eq!((ed.plan.findings.silences.len(), ed.plan.findings.found.len()), (silences + 1, found + 1));
+        assert!(ed.changed());
+        press(&mut ed, "u");
+        press(&mut ed, "u");
+        assert_eq!(ed.status, "Nothing to undo.");
+    }
+
+    #[test]
+    fn an_ordinary_edit_after_a_rescan_undoes_on_its_own() {
+        let mut ed = missing_editor();
+        let f = rescanned(&ed);
+        ed.apply_rescan(f, 2, 1, None);
+        press(&mut ed, "gg");
+        answer(&mut ed, "2");
+        press(&mut ed, "r");
+        answer(&mut ed, "Deux");
+        assert_eq!(titles(&ed)[1], "Deux");
+        press(&mut ed, "u");
+        assert_eq!(titles(&ed), ["One", "Two", "Four", "Three"], "only the rename is undone");
+        assert_eq!(ed.plan.findings.missing.len(), 1);
+        press(&mut ed, "u");
+        assert_eq!(titles(&ed), ["One", "Two", "Three"]);
+        assert_eq!(ed.plan.findings.missing.len(), 2);
     }
 }
