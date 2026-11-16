@@ -253,6 +253,9 @@ impl Browser {
                         return BrowserOutcome::Chosen(path);
                     }
                     self.enter(path);
+                } else if matches!(self.pick, Pick::Folder) && !path.exists() && path.parent().is_some_and(|p| p.is_dir()) {
+                    self.typed = None;
+                    return BrowserOutcome::Chosen(path);
                 } else if path.is_file() && !matches!(self.pick, Pick::Folder) && wanted(&path.to_string_lossy(), self.pick.extensions()) {
                     return BrowserOutcome::Chosen(path);
                 } else {
@@ -461,6 +464,22 @@ mod tests {
         type_path(&mut b, &dir.join("x.mp3"));
         assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue));
         assert!(b.error.contains("not found"));
+    }
+
+    #[test]
+    fn a_folder_browser_accepts_a_new_folder_whose_parent_exists() {
+        let dir = tree("typednew");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), Pick::Folder);
+        type_path(&mut b, &dir.join("fresh"));
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Chosen(p) if p == dir.join("fresh")));
+        assert!(!dir.join("fresh").exists(), "the browser only names it; the split creates it");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), Pick::Folder);
+        type_path(&mut b, &dir.join("no").join("fresh"));
+        assert!(matches!(b.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue));
+        assert!(b.error.contains("not found"));
+        let mut files = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        type_path(&mut files, &dir.join("fresh"));
+        assert!(matches!(files.handle_key(k(KeyCode::Enter)), BrowserOutcome::Continue), "only the folder picker may name a new path");
     }
 
     #[test]

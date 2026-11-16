@@ -14,6 +14,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
+// The name of the first file that carries a picture, if any.
+pub fn find_embedded_name(plan: &Plan) -> Option<String> {
+    find_embedded(&plan.files).map(|(i, _)| file_name(&plan.files[i].path))
+}
+
 const LABELS: [&str; 6] = ["Album", "Artist", "Album artist", "Genre", "Year", "File naming"];
 const COVER_ROW: usize = 6;
 const IMAGE_ROW: usize = 7;
@@ -42,7 +47,13 @@ pub struct TagsForm {
 }
 
 impl TagsForm {
+    // Looks for the embedded cover itself (runs ffprobe). The editor caches that and uses `from_plan_with`.
+    #[cfg(test)]
     pub fn from_plan(plan: &Plan) -> TagsForm {
+        TagsForm::from_plan_with(plan, find_embedded_name(plan))
+    }
+
+    pub fn from_plan_with(plan: &Plan, embedded: Option<String>) -> TagsForm {
         let m = &plan.metadata;
         let (cover, image) = match &m.cover {
             Cover::Keep => (CoverChoice::Keep, String::new()),
@@ -53,7 +64,7 @@ impl TagsForm {
             inputs: [&m.album, &m.artist, &m.album_artist, &m.genre, &m.year, &m.template].iter().map(|v| Input::new(v)).collect(),
             cover,
             image: Input::new(&image),
-            embedded: find_embedded(&plan.files).map(|(i, _)| file_name(&plan.files[i].path)),
+            embedded,
             focus: 0,
             browser: None,
             error: String::new(),

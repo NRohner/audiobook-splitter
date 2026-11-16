@@ -26,7 +26,11 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn new() -> Result<TerminalGuard, String> {
-        ratatui::try_init().map(|terminal| TerminalGuard { terminal }).map_err(|e| e.to_string())
+        ratatui::try_init().map(|terminal| TerminalGuard { terminal }).map_err(|e| {
+            // try_init can fail after raw mode or the alternate screen is already on.
+            ratatui::restore();
+            e.to_string()
+        })
     }
 }
 

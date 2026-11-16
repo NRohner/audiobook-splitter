@@ -23,7 +23,23 @@ pub const AUDIO_EXTENSIONS: [&str; 7] = ["mp3", "m4b", "wav", "flac", "aac", "m4
 pub fn user_path(input: &str) -> PathBuf {
     let s = input.trim();
     let unquoted = ['"', '\''].iter().find_map(|&q| s.strip_prefix(q)?.strip_suffix(q));
-    PathBuf::from(unquoted.unwrap_or(s))
+    let text = unquoted.unwrap_or(s);
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|h| !h.is_empty()).map(PathBuf::from);
+    expand_home(text, home.as_deref())
+}
+
+// A leading `~` or `~/` becomes `home`; `~name` and a `~` elsewhere are left alone.
+fn expand_home(text: &str, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else { return PathBuf::from(text) };
+    let Some(rest) = text.strip_prefix('~') else { return PathBuf::from(text) };
+    if rest.is_empty() {
+        return home.to_path_buf();
+    }
+    let sep = |c: char| c == '/' || (cfg!(windows) && c == '\\');
+    match rest.strip_prefix(sep) {
+        Some(tail) => home.join(tail),
+        None => PathBuf::from(text),
+    }
 }
 
 // A detected silence region, in seconds.
@@ -391,6 +407,20 @@ mod tests {
 
     fn s(start: f64, duration: f64) -> Silence {
         Silence { start, end: start + duration, duration }
+    }
+
+    #[test]
+    fn tilde_expands_only_alone_or_before_a_separator() {
+        let home = Path::new("/home/me");
+        assert_eq!(expand_home("~", Some(home)), PathBuf::from("/home/me"));
+        assert_eq!(expand_home("~/Audiobooks/Book", Some(home)), PathBuf::from("/home/me").join("Audiobooks/Book"));
+        assert_eq!(expand_home("~/", Some(home)), PathBuf::from("/home/me"));
+        assert_eq!(expand_home("~bob/x", Some(home)), PathBuf::from("~bob/x"));
+        assert_eq!(expand_home("a/~/b", Some(home)), PathBuf::from("a/~/b"));
+        assert_eq!(expand_home("~/x", None), PathBuf::from("~/x"), "no home known: left alone");
+        if cfg!(windows) {
+            assert_eq!(expand_home(r"~\Books", Some(home)), PathBuf::from("/home/me").join("Books"));
+        }
     }
 
     #[test]

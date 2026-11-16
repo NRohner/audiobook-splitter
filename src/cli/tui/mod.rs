@@ -52,6 +52,8 @@ enum Screen {
     Done(DoneInfo),
 }
 
+// Built once per job and moved straight on, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum Finished {
     Analysis(Result<Plan, String>),
     Split(Result<SplitReport, String>),
@@ -157,10 +159,10 @@ impl App {
             }
         };
         self.plan_error = None;
-        if let Some(path) = &self.plan_path {
-            if let Err(e) = plan.save(path) {
-                self.plan_error = Some(e.to_string());
-            }
+        if let Some(path) = &self.plan_path
+            && let Err(e) = plan.save(path)
+        {
+            self.plan_error = Some(e.to_string());
         }
         self.out = Some(out.clone());
         let (files, cover) = (plan.files.clone(), plan.metadata.cover.clone());
@@ -295,7 +297,7 @@ impl App {
         if self.confirm_quit {
             let rect = editor::centered(area, 60, 3);
             f.render_widget(Clear, rect);
-            f.render_widget(Paragraph::new("A job is running. Quit anyway?   y quit    any other key: keep going").block(Block::bordered().title(" Quit ")), rect);
+            f.render_widget(Paragraph::new("Job running. Quit anyway?  y quit  other key: stay").block(Block::bordered().title(" Quit ")), rect);
         }
         if self.help {
             match &self.screen {
@@ -335,6 +337,11 @@ fn render_done(f: &mut Frame, area: Rect, info: &DoneInfo) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().title(" Done ")), area);
 }
 
+// Only a panic on the UI thread may restore the terminal; the app is still drawing otherwise.
+fn should_restore(ui: std::thread::ThreadId, current: std::thread::ThreadId) -> bool {
+    ui == current
+}
+
 // `tui`: the full-screen app, from choosing the book to splitting it.
 pub fn run(args: Args) -> Result<(), String> {
     if !terminal::suitable(false) {
@@ -343,23 +350,23 @@ pub fn run(args: Args) -> Result<(), String> {
     check_tools()?;
     let mut app = App::new(args.path.as_deref().map(|p| user_path(&p.to_string_lossy())).as_deref())?;
     let mut guard = TerminalGuard::new()?;
-    // `ratatui::try_init` made a panic hook that restores the terminal. A panic in a job thread
-    // is caught and shown as an error, so that hook must not run for it.
+    // `ratatui::try_init` made a panic hook that restores the terminal. A panic on any other
+    // thread (a job, or workers it starts) is caught and shown as an error, so that hook
+    // must run only for the thread that owns the screen.
+    let ui = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current().name() == Some("tui-job") {
-            return;
+        if should_restore(ui, std::thread::current().id()) {
+            previous(info);
         }
-        previous(info);
     }));
     while !app.is_over() {
         guard.terminal.draw(|f| app.render(f)).map_err(|e| e.to_string())?;
-        if event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
-            if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
-                }
-            }
+        if event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())?
+            && let Event::Key(key) = event::read().map_err(|e| e.to_string())?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key);
         }
         app.tick();
     }
@@ -398,6 +405,14 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::Terminal;
     use std::time::Duration;
+
+    #[test]
+    fn only_the_ui_thread_restores_the_terminal_on_a_panic() {
+        let ui = std::thread::current().id();
+        assert!(should_restore(ui, std::thread::current().id()));
+        let other = std::thread::spawn(move || should_restore(ui, std::thread::current().id())).join().unwrap();
+        assert!(!other, "an unnamed worker thread must not restore the terminal");
+    }
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -704,6 +719,16 @@ mod tests {
         let screen = draw(&mut app, 100, 24);
         assert!(screen.contains("could not be saved"), "{}", screen);
         assert!(!screen.contains("The plan is saved"), "{}", screen);
+    }
+
+    #[test]
+    fn the_quit_popup_is_readable_at_60x15() {
+        let mut app = App::new(None).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel::<jobs::Msg<Plan>>();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let screen = draw(&mut app, 60, 15);
+        assert!(screen.contains("other key: stay"), "{}", screen);
     }
 
     #[test]

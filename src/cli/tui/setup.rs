@@ -100,11 +100,11 @@ impl Setup {
             return Err(format!("No supported audio files found in '{}'.", path.display()));
         }
         let epub_text = self.fields[1].value();
-        let epub = Some(user_path(&epub_text)).filter(|_| !epub_text.trim().is_empty());
-        if let Some(e) = &epub {
-            if !e.is_file() {
-                return Err(format!("The EPUB '{}' was not found.", e.display()));
-            }
+        let epub = (!epub_text.trim().is_empty()).then(|| user_path(&epub_text));
+        if let Some(e) = &epub
+            && !e.is_file()
+        {
+            return Err(format!("The EPUB '{}' was not found.", e.display()));
         }
         let out_text = self.fields[2].value();
         if out_text.trim().is_empty() {
@@ -158,6 +158,7 @@ impl Setup {
             }
             KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Enter if self.focus == CACHE_ROW => self.cache = !self.cache,
             _ if self.focus < CACHE_ROW => {
+                #[allow(clippy::collapsible_match)] // the guard would hide the side effect of typing
                 if self.fields[self.focus].handle_key(key) {
                     self.refresh(self.focus);
                 }
@@ -176,10 +177,10 @@ impl Setup {
         let field_w = inner.width.saturating_sub(label_w + note_w + 2).max(8) as usize;
         let mut lines = Vec::new();
         let mut cursor = None;
-        for row in 0..ROWS {
+        for (row, name) in LABELS.iter().enumerate() {
             let hot = self.focus == row;
             let label_style = if hot { Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED) } else { Style::new().add_modifier(Modifier::BOLD) };
-            let label = Span::styled(format!("{:<w$}", LABELS[row], w = label_w as usize), label_style);
+            let label = Span::styled(format!("{:<w$}", name, w = label_w as usize), label_style);
             if row == CACHE_ROW {
                 lines.push(Line::from(vec![label, Span::raw(if self.cache { "[x] on" } else { "[ ] off" })]));
             } else {

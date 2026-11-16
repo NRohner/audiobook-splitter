@@ -6,7 +6,7 @@ mod view;
 pub(crate) use view::centered;
 
 use super::input::Input;
-use super::tags::{FormOutcome, TagsForm};
+use super::tags::{self, FormOutcome, TagsForm};
 use crate::cli::edit::ops::{self, Pos};
 use crate::cli::preview::write_clip;
 use crate::cli::time::{clock, parse_time};
@@ -50,7 +50,7 @@ pub(super) enum Mode {
     Normal,
     Prompt { kind: Prompt, input: Input },
     List { kind: ListKind, items: Vec<String>, selected: usize },
-    Tags(TagsForm),
+    Tags(Box<TagsForm>),
     ConfirmQuit,
     ConfirmBack,
     Help,
@@ -66,6 +66,8 @@ pub struct Editor {
     pub(super) table: TableState,
     pub(super) mode: Mode,
     pub(super) status: String,
+    // Which file carries the cover picture, found on the first `t` (the audio doesn't change while editing).
+    embedded_cover: Option<Option<String>>,
 }
 
 impl Editor {
@@ -86,7 +88,20 @@ impl Editor {
             table: TableState::default(),
             mode: Mode::Normal,
             status: String::new(),
+            embedded_cover: None,
         }
+    }
+
+    // What `s` does here: the tui app splits at once, edit/run save and carry on.
+    fn finish_verb(&self) -> &'static str {
+        if self.allow_back { "split" } else { "save" }
+    }
+
+    // Opens the tags form. `lookup` (ffprobe over the files) runs only the first time.
+    fn open_tags(&mut self, lookup: impl FnOnce(&Plan) -> Option<String>) {
+        let plan = &self.plan;
+        let embedded = self.embedded_cover.get_or_insert_with(|| lookup(plan)).clone();
+        self.mode = Mode::Tags(Box::new(TagsForm::from_plan_with(&self.plan, embedded)));
     }
 
     // Whether the chapters or tags differ from what the editor started with.
@@ -199,7 +214,7 @@ impl Editor {
             KeyCode::Char('a') => self.open_add(),
             KeyCode::Char('n') => self.open_silences(None),
             KeyCode::Char('m') => self.open_missing(),
-            KeyCode::Char('t') => self.mode = Mode::Tags(TagsForm::from_plan(&self.plan)),
+            KeyCode::Char('t') => self.open_tags(tags::find_embedded_name),
             KeyCode::Char('g') => self.mode = Mode::Prompt { kind: Prompt::Jump, input: Input::new("") },
             KeyCode::Char('p') => {
                 self.status = match write_clip(&self.plan, i + 1, None) {
@@ -389,7 +404,7 @@ impl Editor {
         }
     }
 
-    fn key_tags(&mut self, mut form: TagsForm, key: KeyEvent) -> Outcome {
+    fn key_tags(&mut self, mut form: Box<TagsForm>, key: KeyEvent) -> Outcome {
         match form.handle_key(key) {
             FormOutcome::Continue => self.mode = Mode::Tags(form),
             FormOutcome::Cancel => {}
@@ -693,6 +708,32 @@ mod tests {
         press(&mut ed, "jp");
         assert!(!ed.status.is_empty());
         assert!(!ed.status.starts_with("Wrote"));
+    }
+
+    #[test]
+    fn the_embedded_cover_is_looked_up_once_per_editor() {
+        let mut ed = editor();
+        let mut calls = 0;
+        for _ in 0..3 {
+            ed.open_tags(|_| {
+                calls += 1;
+                Some("a.mp3".to_string())
+            });
+            assert!(matches!(ed.mode, Mode::Tags(_)));
+            ed.handle_key(k(KeyCode::Esc));
+        }
+        assert_eq!(calls, 1);
+        assert_eq!(ed.embedded_cover, Some(Some("a.mp3".to_string())));
+        // A "no picture" answer is cached too.
+        let mut ed = editor();
+        let mut calls = 0;
+        for _ in 0..2 {
+            ed.open_tags(|_| {
+                calls += 1;
+                None
+            });
+        }
+        assert_eq!(calls, 1);
     }
 
     #[test]

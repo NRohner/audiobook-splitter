@@ -100,12 +100,13 @@ impl Editor {
     }
 
     fn render_footer(&self, f: &mut Frame, area: Rect) {
+        let v = self.finish_verb();
         let keys = if area.width >= 100 {
-            "j/k move  r rename  [ ] move break  d remove  a add  n silence  m missing  t tags  g jump  p preview  u undo  s save  q quit  ? help"
+            format!("j/k move  r rename  [ ] move break  d remove  a add  n silence  m missing  t tags  g jump  p preview  u undo  s {}  q quit  ? help", v)
         } else if area.width >= 62 {
-            "r rename  [ ] move  d remove  a add  t tags  u undo  s save  q quit  ? help"
+            format!("r rename  [ ] move  d remove  a add  t tags  u undo  s {}  q quit  ? help", v)
         } else {
-            "? help  s save  q quit"
+            format!("? help  s {}  q quit", v)
         };
         let status = Span::styled(self.status.clone(), Style::new().fg(Color::Yellow));
         f.render_widget(Paragraph::new(vec![Line::raw(keys), Line::from(status)]), area);
@@ -134,7 +135,7 @@ impl Editor {
                     ListKind::Silence { .. } => " Start a chapter at ",
                     ListKind::Missing => " Chapters with no break (Enter: choose a silence) ",
                 };
-                let rect = centered(area, 70, (items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3));
+                let rect = centered(area, 70, (items.len().min(u16::MAX as usize - 2) as u16).saturating_add(2).min(area.height.saturating_sub(2)).max(3));
                 let mut state = ListState::default();
                 state.select(Some(*selected));
                 let list = List::new(items.iter().map(|s| ListItem::new(s.as_str())))
@@ -145,11 +146,21 @@ impl Editor {
                 f.render_stateful_widget(list, rect, &mut state);
             }
             Mode::Tags(form) => form.render(f, area),
-            Mode::ConfirmQuit => confirm(f, area, " Unsaved changes ", "s save and continue    d discard    Esc keep editing"),
-            Mode::ConfirmBack => confirm(f, area, " Go back? ", "Your edits to the chapters will be lost.    y go back    Esc stay"),
+            Mode::ConfirmQuit => {
+                let text = if self.allow_back { "s split now    d discard    Esc keep editing" } else { "s save and continue    d discard    Esc keep editing" };
+                confirm(f, area, " Unsaved changes ", text)
+            }
+            Mode::ConfirmBack => confirm(f, area, " Go back? ", "Edits will be lost.   y go back   Esc stay"),
             Mode::Help => {
                 let rect = centered(area, 76, HELP.len() as u16 + 2);
-                let lines: Vec<Line> = HELP.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("{:<26}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(*d)])).collect();
+                let splits = self.allow_back;
+                let lines: Vec<Line> = HELP
+                    .iter()
+                    .map(|(k, d)| {
+                        let d = if splits && *k == "s / q, Ctrl-c" { "split / quit (asks if unsaved)" } else { d };
+                        Line::from(vec![Span::styled(format!("{:<26}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(d)])
+                    })
+                    .collect();
                 f.render_widget(Clear, rect);
                 f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")), rect);
             }
@@ -264,6 +275,40 @@ mod tests {
         ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         ed.handle_key(k('?'));
         draw(&mut ed, 60, 15);
+    }
+
+    #[test]
+    fn the_keys_say_split_in_the_app_and_save_otherwise() {
+        let mut ed = Editor::new(sample_plan());
+        assert!(draw(&mut ed, 80, 24).contains("s save"));
+        ed.handle_key(k('?'));
+        assert!(draw(&mut ed, 80, 24).contains("save / quit (asks if unsaved)"));
+        ed.handle_key(k('x'));
+        ed.allow_back = true;
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("s split") && !screen.contains("s save"), "{}", screen);
+        ed.handle_key(k('?'));
+        assert!(draw(&mut ed, 80, 24).contains("split / quit (asks if unsaved)"));
+        ed.handle_key(k('x'));
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        ed.handle_key(k('q'));
+        let screen = draw(&mut ed, 80, 24);
+        assert!(screen.contains("s split now"), "{}", screen);
+    }
+
+    #[test]
+    fn the_confirm_popups_fit_at_60x15() {
+        let mut ed = Editor::new(sample_plan());
+        ed.allow_back = true;
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        ed.handle_key(k('b'));
+        let screen = draw(&mut ed, 60, 15);
+        assert!(screen.contains("Esc stay"), "{}", screen);
+        ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ed.handle_key(k('q'));
+        assert!(draw(&mut ed, 60, 15).contains("Esc keep editing"));
     }
 
     #[test]

@@ -13,6 +13,15 @@ pub struct Job<T> {
     rx: Receiver<Msg<T>>,
 }
 
+// The message a panic carried, when it was a string.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string())
+}
+
 impl<T: Send + 'static> Job<T> {
     pub fn spawn(work: impl FnOnce(&mut dyn FnMut(Event)) -> Result<T, String> + Send + 'static) -> Job<T> {
         let (tx, rx) = mpsc::channel();
@@ -23,7 +32,7 @@ impl<T: Send + 'static> Job<T> {
                     let _ = tx.send(Msg::Event(e));
                 })
             }))
-            .unwrap_or_else(|_| Err("The background job crashed.".to_string()));
+            .unwrap_or_else(|payload| Err(format!("The background job crashed: {}", panic_text(payload.as_ref()))));
             let _ = tx.send(Msg::Done(result));
         });
         if let Err(e) = spawned {
@@ -84,6 +93,15 @@ mod tests {
     fn a_panicking_job_becomes_an_error_instead_of_hanging_the_screen() {
         let job: Job<u32> = Job::spawn(|_| panic!("boom"));
         assert!(drain(&job).1.unwrap_err().contains("crashed"));
+    }
+
+    #[test]
+    fn a_panicking_job_keeps_the_panic_message() {
+        let job: Job<u32> = Job::spawn(|_| panic!("disk {} exploded", 7));
+        let e = drain(&job).1.unwrap_err();
+        assert!(e.contains("crashed") && e.contains("disk 7 exploded"), "{}", e);
+        let job: Job<u32> = Job::spawn(|_| panic!("static text"));
+        assert!(drain(&job).1.unwrap_err().contains("static text"));
     }
 
     #[test]
