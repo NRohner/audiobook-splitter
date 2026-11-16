@@ -1,6 +1,7 @@
 // The full-screen terminal UI: the chapter editor (used by `edit` and `run`) and the `tui` app.
 pub mod browser;
 pub mod editor;
+pub mod help;
 pub mod input;
 pub mod jobs;
 pub mod progress;
@@ -64,6 +65,7 @@ pub struct App {
     out: Option<PathBuf>,
     plan_path: Option<PathBuf>,
     confirm_quit: bool,
+    help: bool,
     quit: bool,
     // Why the plan could not be saved when the split started; shown on the Done screen.
     plan_error: Option<String>,
@@ -94,6 +96,7 @@ impl App {
                 out: None,
                 plan_path: None,
                 confirm_quit: false,
+                help: false,
                 quit: false,
                 plan_error: None,
             }),
@@ -104,7 +107,7 @@ impl App {
     pub fn with_plan(plan: Plan, plan_path: Option<PathBuf>) -> App {
         let mut editor = Editor::new(plan);
         editor.allow_back = true;
-        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, quit: false, plan_error: None }
+        App { screen: Screen::Editor(Box::new(editor)), setup: Setup::new(None), out: None, plan_path, confirm_quit: false, help: false, quit: false, plan_error: None }
     }
 
     pub fn is_over(&self) -> bool {
@@ -220,6 +223,14 @@ impl App {
             }
             return;
         }
+        if self.help {
+            self.help = false;
+            return;
+        }
+        if key.code == KeyCode::Char('?') && matches!(self.screen, Screen::Analyzing { .. } | Screen::Splitting { .. } | Screen::Done(_)) {
+            self.help = true;
+            return;
+        }
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.screen, Screen::Setup) {
             Screen::Setup => match self.setup.handle_key(key) {
@@ -283,6 +294,12 @@ impl App {
             f.render_widget(Clear, rect);
             f.render_widget(Paragraph::new("A job is running. Quit anyway?   y quit    any other key: keep going").block(Block::bordered().title(" Quit ")), rect);
         }
+        if self.help {
+            match &self.screen {
+                Screen::Done(_) => help::render_help(f, area, "Keys", help::DONE_KEYS),
+                _ => help::render_help(f, area, "Keys", help::PROGRESS_KEYS),
+            }
+        }
     }
 }
 
@@ -307,7 +324,7 @@ fn render_done(f: &mut Frame, area: Rect, info: &DoneInfo) {
         (None, None) => {}
     }
     lines.push(Line::raw(""));
-    lines.push(Line::raw("n  another book    q or Enter  quit"));
+    lines.push(Line::raw("n  another book    q or Enter  quit    ? help"));
     if info.failed > 0 || info.error.is_some() {
         lines.push(Line::raw(""));
         lines.extend(info.log.iter().map(|l| Line::raw(l.as_str())));
@@ -461,6 +478,66 @@ mod tests {
         app.handle_key(ch('n'));
         assert!(matches!(app.screen, Screen::Setup), "another book returns to Setup");
         assert!(!app.is_over());
+    }
+
+    #[test]
+    fn question_mark_opens_help_on_the_progress_and_done_screens() {
+        let mut app = App::new(None).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.screen = Screen::Analyzing { progress: progress::Progress::new("Analyzing"), job: jobs::Job::from_receiver(rx) };
+        assert!(draw(&mut app, 80, 24).contains("? help"), "the hint names the key");
+        app.handle_key(ch('?'));
+        assert!(draw(&mut app, 80, 24).contains("Ctrl-c"));
+        app.handle_key(ch('x'));
+        assert!(!app.is_over() && matches!(app.screen, Screen::Analyzing { .. }), "the closing key does nothing else");
+        app.screen = Screen::Done(DoneInfo { written: 3, failed: 0, out: "/tmp/out".into(), plan_path: None, error: None, plan_error: None, log: Vec::new() });
+        assert!(draw(&mut app, 80, 24).contains("? help"));
+        app.handle_key(ch('?'));
+        assert!(draw(&mut app, 80, 24).contains("back to Setup"), "only the help popup says this");
+        app.handle_key(ch('x'));
+        assert!(matches!(app.screen, Screen::Done(_)));
+    }
+
+    #[test]
+    fn popups_draw_at_small_sizes_on_every_screen() {
+        let mut plan = sample_plan();
+        plan.findings.breaks[1].title = "A very long title ".repeat(10);
+        let mut app = App::with_plan(plan, None);
+        let sizes = [(80, 24), (60, 15), (40, 8), (20, 5)];
+        for keys in ["", "r", "\u{1b}n", "\u{1b}?", "\u{1b}\u{1b}t"] {
+            for c in keys.chars() {
+                app.handle_key(if c == '\u{1b}' { k(KeyCode::Esc) } else { ch(c) });
+            }
+            for (w, h) in sizes {
+                draw(&mut app, w, h);
+            }
+        }
+        app.handle_key(k(KeyCode::Esc));
+        app.handle_key(ch('x'));
+        app.handle_key(ch('s')); // no output folder: the browser opens
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        let mut setup = App::new(None).unwrap();
+        setup.handle_key(k(KeyCode::Enter)); // the Setup file browser
+        setup.handle_key(k(KeyCode::Tab)); // typing a path
+        for (w, h) in sizes {
+            draw(&mut setup, w, h);
+        }
+        setup.handle_key(k(KeyCode::Esc)); // leaves typing
+        setup.handle_key(k(KeyCode::Esc)); // closes the browser
+        setup.handle_key(k(KeyCode::F(1)));
+        for (w, h) in sizes {
+            draw(&mut setup, w, h);
+        }
+        app.screen = Screen::Done(DoneInfo { written: 1, failed: 2, out: "/a/very/long/output/folder/name".into(), plan_path: Some("/p/plan.json".into()), error: Some("boom".into()), plan_error: None, log: Vec::new() });
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
+        app.handle_key(ch('?'));
+        for (w, h) in sizes {
+            draw(&mut app, w, h);
+        }
     }
 
     #[test]

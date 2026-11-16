@@ -46,7 +46,7 @@ impl Progress {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::bordered().title(format!(" {} ", self.title));
+        let block = Block::bordered().title(format!(" {}  (q quit, ? help) ", self.title));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [gauge_row, log_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);

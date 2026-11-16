@@ -7,19 +7,17 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, 
 use ratatui::Frame;
 
 const HELP: &[(&str, &str)] = &[
-    ("Up/Down, j/k, PgUp/PgDn, Home/End", "move the selection"),
+    ("j/k, arrows, PgUp/PgDn", "move the selection"),
     ("Enter, r", "rename the chapter"),
     ("[  ]", "move the break to the previous / next silence"),
     ("d", "remove the chapter"),
-    ("a", "add a chapter at a time"),
-    ("n", "add a chapter at a silence that has none"),
+    ("a / n", "add a chapter at a time / at a silence that has none"),
     ("m", "chapters the EPUB match missed"),
     ("t", "tags, file naming and cover art"),
     ("g", "jump to a time (1:02:03) or a chapter number"),
     ("p", "write a preview clip of the selected break"),
     ("u / Ctrl-r", "undo / redo"),
-    ("s", "save and continue"),
-    ("q, Ctrl-c", "quit (asks if there are unsaved changes)"),
+    ("s / q, Ctrl-c", "save and continue / quit (asks if unsaved)"),
     ("b", "back to Setup (only in `tui`)"),
     ("?", "this help"),
 ];
@@ -73,6 +71,15 @@ impl Editor {
 
     fn render_detail(&self, f: &mut Frame, area: Rect) {
         let Some(b) = self.plan.findings.breaks.get(self.selected) else { return };
+        if area.height < 3 {
+            // Too short for a bordered box: one summary line.
+            let line = Line::from(vec![
+                Span::styled(format!("Chapter {}: ", self.selected + 1), Style::new().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{}  at {}", b.title, place(&self.plan, b.file, b.at))),
+            ]);
+            f.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let mut lines = vec![Line::from(vec![
             Span::styled(format!("Chapter {}: ", self.selected + 1), Style::new().add_modifier(Modifier::BOLD)),
             Span::raw(format!("{}  at {}", b.title, place(&self.plan, b.file, b.at))),
@@ -141,8 +148,8 @@ impl Editor {
             Mode::ConfirmQuit => confirm(f, area, " Unsaved changes ", "s save and continue    d discard    Esc keep editing"),
             Mode::ConfirmBack => confirm(f, area, " Go back? ", "Your edits to the chapters will be lost.    y go back    Esc stay"),
             Mode::Help => {
-                let rect = centered(area, 78, HELP.len() as u16 + 2);
-                let lines: Vec<Line> = HELP.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("{:<36}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(*d)])).collect();
+                let rect = centered(area, 76, HELP.len() as u16 + 2);
+                let lines: Vec<Line> = HELP.iter().map(|(k, d)| Line::from(vec![Span::styled(format!("{:<24}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(*d)])).collect();
                 f.render_widget(Clear, rect);
                 f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Keys (any key closes) ")), rect);
             }
@@ -257,6 +264,24 @@ mod tests {
         ed.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         ed.handle_key(k('?'));
         draw(&mut ed, 60, 15);
+    }
+
+    #[test]
+    fn the_help_popup_fits_at_60x15_with_the_last_keys() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('?'));
+        let screen = draw(&mut ed, 60, 15);
+        for want in ["undo", "jump", "back to Setup", "quit"] {
+            assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
+        }
+    }
+
+    #[test]
+    fn a_short_terminal_shows_a_one_line_summary_instead_of_an_empty_detail_box() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('j'));
+        let screen = draw(&mut ed, 60, 12);
+        assert!(screen.contains("Chapter 2: Two"), "{}", screen);
     }
 
     #[test]

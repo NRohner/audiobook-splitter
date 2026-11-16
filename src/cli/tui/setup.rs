@@ -36,6 +36,7 @@ pub struct Setup {
     focus: usize,
     browser: Option<(usize, Browser)>,
     feedback: [String; 3], // live notes beside the three path rows
+    help: bool,
     pub error: String,
 }
 
@@ -74,6 +75,7 @@ impl Setup {
             focus: 0,
             browser: None,
             feedback: Default::default(),
+            help: false,
             error: String::new(),
         };
         s.refresh(0);
@@ -119,6 +121,10 @@ impl Setup {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SetupOutcome {
+        if self.help {
+            self.help = false;
+            return SetupOutcome::Continue;
+        }
         if let Some((row, mut browser)) = self.browser.take() {
             match browser.handle_key(key) {
                 BrowserOutcome::Continue => self.browser = Some((row, browser)),
@@ -134,6 +140,7 @@ impl Setup {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => return SetupOutcome::Quit,
+            KeyCode::F(1) => self.help = true,
             KeyCode::Char('c') if ctrl => return SetupOutcome::Quit,
             KeyCode::Char('a') if ctrl => match self.request() {
                 Ok(req) => return SetupOutcome::Start(req),
@@ -147,7 +154,7 @@ impl Setup {
                     1 => ("Choose the EPUB", Pick::File(&["epub"])),
                     _ => ("Choose the output folder", Pick::Folder),
                 };
-                self.browser = Some((self.focus, Browser::new(title, &self.fields[self.focus].value(), pick)));
+                self.browser = Some((self.focus, Browser::new(title, &user_path(&self.fields[self.focus].value()).to_string_lossy(), pick)));
             }
             KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right | KeyCode::Enter if self.focus == CACHE_ROW => self.cache = !self.cache,
             _ if self.focus < CACHE_ROW => {
@@ -186,7 +193,8 @@ impl Setup {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(self.error.clone(), Style::new().fg(Color::Yellow)));
-        lines.push(Line::raw("Tab next   Enter browse (path rows)   Space toggle   Ctrl-A analyze   Esc quit"));
+        lines.push(Line::raw("Tab next   Enter browse (path rows)   Space toggle"));
+        lines.push(Line::raw("Ctrl-A analyze   F1 help   Esc quit"));
         f.render_widget(Paragraph::new(lines), inner);
         match &mut self.browser {
             Some((_, browser)) => browser.render(f, area),
@@ -195,6 +203,9 @@ impl Setup {
                     f.set_cursor_position(pos);
                 }
             }
+        }
+        if self.help {
+            super::help::render_help(f, area, "Setup keys", super::help::SETUP_KEYS);
         }
     }
 }
@@ -228,6 +239,42 @@ mod tests {
         let mut s = Setup::new(Some(dir.to_str().unwrap()));
         s.fields[2] = Input::new(out.to_str().unwrap());
         s
+    }
+
+    fn screen_of(s: &mut Setup, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| s.render(f, f.area())).unwrap();
+        let buf = t.backend().buffer();
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn f1_opens_help_and_any_key_closes_it_without_typing() {
+        let mut s = Setup::new(None);
+        s.handle_key(k(KeyCode::F(1)));
+        assert!(s.help);
+        s.handle_key(k(KeyCode::Char('x')));
+        assert!(!s.help);
+        assert_eq!(s.fields[0].value(), "", "the key that closed the help is not typed");
+        s.handle_key(k(KeyCode::F(1)));
+        let screen = screen_of(&mut s, 80, 24);
+        assert!(screen.contains("Ctrl-U") && screen.contains("clear the field"), "only the help popup lists these:\n{}", screen);
+    }
+
+    #[test]
+    fn the_hint_keeps_ctrl_a_and_f1_visible_at_60x15() {
+        let mut s = Setup::new(None);
+        let screen = screen_of(&mut s, 60, 15);
+        assert!(screen.contains("Ctrl-A") && screen.contains("F1") && screen.contains("Esc quit"), "{}", screen);
+    }
+
+    #[test]
+    fn the_browser_starts_at_the_cleaned_up_path() {
+        let (dir, _) = folder("quoted");
+        let mut s = Setup::new(Some(&format!("  \"{}\"  ", dir.display())));
+        s.handle_key(k(KeyCode::Enter));
+        let (_, b) = s.browser.as_ref().unwrap();
+        assert_eq!(b.dir(), dir.as_path());
     }
 
     #[test]

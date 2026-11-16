@@ -179,7 +179,7 @@ impl TagsForm {
         }
         lines.push(Line::styled(self.error.clone(), Style::new().fg(ratatui::style::Color::Yellow)));
         f.render_widget(Paragraph::new(lines), inner);
-        if let Some(pos) = cursor {
+        if let Some(pos) = cursor.filter(|_| self.browser.is_none()) {
             f.set_cursor_position(pos);
         }
         if let Some(browser) = &mut self.browser {
@@ -193,7 +193,8 @@ mod tests {
     use super::*;
     use crate::cli::edit::ops::sample_plan;
     use audiobook_splitter_rust::meta::Cover;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::layout::Position;
     use ratatui::Terminal;
 
     fn k(code: KeyCode) -> KeyEvent {
@@ -372,6 +373,23 @@ mod tests {
         let screen = draw(&mut form, 80, 24);
         assert!(screen.contains("only.png") && !screen.contains("notes.txt"), "{}", screen);
         draw(&mut form, 60, 15);
+    }
+
+    #[test]
+    fn the_form_does_not_set_the_cursor_while_the_browser_covers_it() {
+        let image = png("cursor.png");
+        let mut form = TagsForm::from_plan(&plan());
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| form.render(f, f.area())).unwrap();
+        assert_ne!(t.backend_mut().get_cursor_position().unwrap(), Position::new(0, 0), "the form shows its cursor");
+        form.focus = IMAGE_ROW;
+        form.cover = CoverChoice::Image;
+        form.image = Input::new(image.to_str().unwrap());
+        form.handle_key(ctrl('b'));
+        assert!(form.browser.is_some());
+        t.backend_mut().set_cursor_position(Position::new(0, 0)).unwrap();
+        t.draw(|f| form.render(f, f.area())).unwrap();
+        assert_eq!(t.backend_mut().get_cursor_position().unwrap(), Position::new(0, 0), "the form left the cursor alone");
     }
 
     #[test]
