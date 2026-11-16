@@ -4,6 +4,7 @@ pub mod editor;
 pub mod input;
 pub mod jobs;
 pub mod progress;
+pub mod setup;
 pub mod tags;
 pub mod terminal;
 
