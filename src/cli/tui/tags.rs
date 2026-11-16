@@ -81,6 +81,7 @@ impl TagsForm {
                 _ => {}
             },
             _ if self.focus == IMAGE_ROW => {
+                // Deliberate guard: Option/Alt chords that some terminals send as ALT+char must not be typed into the path.
                 if !key.modifiers.contains(KeyModifiers::ALT) {
                     self.image.handle_key(key);
                 }
@@ -118,7 +119,7 @@ impl TagsForm {
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let rows = self.rows() as u16;
-        let rect = super::editor::centered(area, 76, rows + 5);
+        let rect = super::editor::centered(area, 76, rows + 6);
         f.render_widget(Clear, rect);
         let block = Block::bordered().title(" Tags, file naming and cover art (Tab next, Enter save, Esc cancel) ");
         let inner = block.inner(rect);
@@ -305,5 +306,24 @@ mod tests {
         }
         let mut small = Terminal::new(TestBackend::new(60, 15)).unwrap();
         small.draw(|f| form.render(f, f.area())).unwrap();
+    }
+
+    #[test]
+    fn a_refused_save_shows_its_error_at_every_size() {
+        for cover in [CoverChoice::Keep, CoverChoice::Image] {
+            for (w, h) in [(80, 24), (60, 15)] {
+                let mut form = TagsForm::from_plan(&plan());
+                form.cover = cover;
+                form.error = "Enter a track naming convention, such as {n} - {title}.".into();
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| form.render(f, f.area())).unwrap();
+                let buf = t.backend().buffer();
+                let screen: String = (0..buf.area.height)
+                    .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(screen.contains("Enter a track naming convention"), "{:?} {}x{} lost the error in\n{}", cover, w, h, screen);
+            }
+        }
     }
 }
