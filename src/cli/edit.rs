@@ -109,7 +109,6 @@ pub fn unused_silences(plan: &Plan) -> Vec<Pos> {
         .collect()
 }
 
-// What Whisper heard either side of a break, if it transcribed there.
 // Sets the cover choice, refusing an image that isn't a readable JPEG or PNG.
 pub fn set_cover(plan: &mut Plan, cover: Cover) -> Result<(), String> {
     validate(&cover)?;
@@ -117,6 +116,7 @@ pub fn set_cover(plan: &mut Plan, cover: Cover) -> Result<(), String> {
     Ok(())
 }
 
+// What Whisper heard either side of a break, if it transcribed there.
 fn heard(plan: &Plan, i: usize) -> Option<(&str, &str)> {
     let at = pos(plan.findings.breaks.get(i)?);
     let s = plan.findings.silences.iter().find(|s| same((s.file, s.at), at))?;

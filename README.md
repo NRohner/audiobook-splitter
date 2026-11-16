@@ -153,7 +153,7 @@ The CLI does everything the GUI does, step by step, joined by a plan file. It wo
 | `rescan <plan>` | Look again for chapters the EPUB match missed (`--chapter N` for one) |
 | `edit <plan>` | Interactive menu: rename, remove, add or move chapters, edit tags and file naming |
 | `preview <plan> <n>` | Write 30 s from break *n* to an MP3, to check by ear (`scp` it, or `--play` locally) |
-| `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, `--cover keep|none|PATH`, ...) |
+| `split <plan> -o <dir>` | Write the tagged files (`--album`, `--artist`, `--template`, `--cover keep\|none\|PATH`, ...) |
 | `run <input> -o <dir>` | Analyze, edit and split in one go (`--yes` skips the editor) |
 | `cache info` / `cache clear [path ...]` | Show or empty the cache of silences and transcripts (see below) |
 | `gui` | Start the web GUI |
