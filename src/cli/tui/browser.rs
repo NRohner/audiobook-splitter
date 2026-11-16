@@ -1,5 +1,5 @@
 // A file browser popup: pick a file or folder with the keyboard, or type a path.
-use super::hints::hint_line;
+use super::hints::wrap_hints;
 use super::input::Input;
 use audiobook_splitter_rust::user_path;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -276,7 +276,16 @@ impl Browser {
         let block = Block::bordered().title(format!(" {} ", self.title));
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        let [path_row, list_row, hint_row] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+        let pairs: &[(&str, &str)] = match self.pick {
+            Pick::Folder => &[("Enter", "open"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
+            Pick::File(_) => &[("Enter", "open or pick"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
+            Pick::FileOrFolder(_) => &[("Enter", "open or pick"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")],
+        };
+        // The hints wrap between commands (at most 3 lines); the error replaces them on one line.
+        let mut hint_lines = wrap_hints(pairs, "  ", inner.width as usize);
+        hint_lines.truncate(3);
+        let hint_h = if self.error.is_empty() { (hint_lines.len() as u16).min(inner.height.saturating_sub(2)).max(1) } else { 1 };
+        let [path_row, list_row, hint_row] = Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(hint_h)]).areas(inner);
 
         let mut cursor = None;
         let path_line = match &self.typed {
@@ -303,12 +312,7 @@ impl Browser {
             f.render_stateful_widget(list, list_row, &mut self.state);
         }
 
-        let hint = match self.pick {
-            Pick::Folder => hint_line(&[("Enter", "open"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
-            Pick::File(_) => hint_line(&[("Enter", "open or pick"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
-            Pick::FileOrFolder(_) => hint_line(&[("Enter", "open or pick"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
-        };
-        let line = if self.error.is_empty() { Paragraph::new(hint) } else { Paragraph::new(self.error.clone()).style(Style::new().fg(Color::Yellow)) };
+        let line = if self.error.is_empty() { Paragraph::new(hint_lines) } else { Paragraph::new(self.error.clone()).style(Style::new().fg(Color::Yellow)) };
         f.render_widget(line, hint_row);
         if let Some(pos) = cursor {
             f.set_cursor_position(pos);
@@ -560,5 +564,23 @@ mod tests {
         let desc = buf[(x + 6, y)].style();
         assert_ne!(desc.fg, Some(Color::Cyan));
         assert!(!desc.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_hint_wraps_between_commands_at_60_columns() {
+        let dir = tree("hintwrap");
+        for pick in [Pick::FileOrFolder(&["mp3"]), Pick::Folder] {
+            let folder = matches!(pick, Pick::Folder);
+            let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+            b.pick = pick;
+            let mut t = Terminal::new(TestBackend::new(60, 24)).unwrap();
+            t.draw(|f| b.render(f, f.area())).unwrap();
+            let buf = t.backend().buffer();
+            let rows: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect();
+            let open = if folder { "Enter open" } else { "Enter open or pick" };
+            for want in [open, "Space choose this folder", "Backspace up", "/ filter", ". hidden", "Tab type path", "Esc cancel"] {
+                assert!(rows.iter().any(|l| l.contains(want)), "{:?} not whole on one line:\n{}", want, rows.join("\n"));
+            }
+        }
     }
 }

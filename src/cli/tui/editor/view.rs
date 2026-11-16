@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
-use super::super::hints::{hint_line, hint_line_sep, hint_spans_sep, key_style};
+use super::super::hints::{key_style, wrap_hints};
 
 const HELP: &[(&str, &str)] = &[
     ("j/k, arrows, Pg, Home/End", "move the selection"),
@@ -37,11 +37,17 @@ impl Editor {
             15..=19 => 4,
             _ => 7,
         };
+        let mut keys = self.footer_keys(area.width as usize);
+        // The table keeps at least 3 rows; a terminal too short for the full list gets the compact one.
+        if area.height < 12 || keys.len() as u16 + 1 + detail_h + 3 > area.height {
+            keys = wrap_hints(&[("?", "help"), ("s", self.finish_verb()), ("q", "quit")], "  ", area.width as usize);
+        }
+        let footer_h = keys.len() as u16 + 1;
         let [table_area, detail_area, footer_area] =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(detail_h), Constraint::Length(2)]).areas(area);
+            Layout::vertical([Constraint::Min(3), Constraint::Length(detail_h), Constraint::Length(footer_h)]).areas(area);
         self.render_table(f, table_area);
         self.render_detail(f, detail_area);
-        self.render_footer(f, footer_area);
+        self.render_footer(f, footer_area, keys);
         self.render_popup(f, area);
     }
 
@@ -100,17 +106,14 @@ impl Editor {
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }).block(Block::bordered().title(" Detail ")), area);
     }
 
-    fn render_footer(&self, f: &mut Frame, area: Rect) {
+    fn footer_keys(&self, width: usize) -> Vec<Line<'static>> {
         let v = self.finish_verb();
-        let keys = if area.width >= 100 {
-            hint_line(&[("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing"), ("t", "tags"), ("g", "jump"), ("p", "preview"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")])
-        } else if area.width >= 62 {
-            hint_line(&[("r", "rename"), ("[ ]", "move"), ("d", "remove"), ("a", "add"), ("t", "tags"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")])
-        } else {
-            hint_line(&[("?", "help"), ("s", v), ("q", "quit")])
-        };
-        let status = Span::styled(self.status.clone(), Style::new().fg(Color::Yellow));
-        f.render_widget(Paragraph::new(vec![keys, Line::from(status)]), area);
+        wrap_hints(&[("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing"), ("t", "tags"), ("g", "jump"), ("p", "preview"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")], "  ", width)
+    }
+
+    fn render_footer(&self, f: &mut Frame, area: Rect, mut lines: Vec<Line<'static>>) {
+        lines.push(Line::from(Span::styled(self.status.clone(), Style::new().fg(Color::Yellow))));
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_popup(&mut self, f: &mut Frame, area: Rect) {
@@ -149,12 +152,10 @@ impl Editor {
             Mode::Tags(form) => form.render(f, area),
             Mode::ConfirmQuit => {
                 let first = if self.allow_back { "split now" } else { "save and continue" };
-                confirm(f, area, " Unsaved changes ", hint_line_sep(&[("s", first), ("d", "discard"), ("Esc", "keep editing")], "    "))
+                confirm(f, area, " Unsaved changes ", None, &[("s", first), ("d", "discard"), ("Esc", "keep editing")], "    ")
             }
             Mode::ConfirmBack => {
-                let mut spans = vec![Span::raw("Edits will be lost.   ")];
-                spans.extend(hint_spans_sep(&[("y", "go back"), ("Esc", "stay")], "   "));
-                confirm(f, area, " Go back? ", Line::from(spans))
+                confirm(f, area, " Go back? ", Some("Edits will be lost."), &[("y", "go back"), ("Esc", "stay")], "   ")
             }
             Mode::Help => {
                 let rect = centered(area, 76, HELP.len() as u16 + 2);
@@ -173,10 +174,14 @@ impl Editor {
     }
 }
 
-fn confirm(f: &mut Frame, area: Rect, title: &str, text: Line) {
-    let rect = centered(area, 72, 3);
+// A popup of an optional sentence and the command hints, wrapped to the popup width.
+pub(crate) fn confirm(f: &mut Frame, area: Rect, title: &str, prose: Option<&str>, pairs: &[(&str, &str)], sep: &str) {
+    let w = 72.min(area.width);
+    let mut lines: Vec<Line> = prose.map(Line::raw).into_iter().collect();
+    lines.extend(wrap_hints(pairs, sep, w.saturating_sub(2) as usize));
+    let rect = centered(area, w, lines.len() as u16 + 2);
     f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), rect);
+    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), rect);
 }
 
 #[cfg(test)]
@@ -371,5 +376,50 @@ mod tests {
         ed.handle_key(k(']'));
         ed.handle_key(k('q'));
         assert_key_style(&mut ed, 80, 24, "Esc keep editing", 3);
+    }
+
+    const COMMANDS: &[&str] = &["j/k move", "r rename", "[ ] move break", "d remove", "a add", "n silence", "m missing", "t tags", "g jump", "p preview", "u undo", "s save", "q quit", "? help"];
+
+    fn rows(ed: &mut Editor, w: u16, h: u16) -> Vec<String> {
+        draw(ed, w, h).lines().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_footer_wraps_between_commands_and_never_cuts_one() {
+        for w in [60u16, 80, 120] {
+            let mut ed = Editor::new(sample_plan());
+            let r = rows(&mut ed, w, 24);
+            let foot = &r[r.len().saturating_sub(6)..];
+            for want in COMMANDS {
+                assert!(foot.iter().any(|l| l.contains(want)), "{:?} not whole on one line at {}:\n{}", want, w, foot.join("\n"));
+            }
+            let used = foot.iter().filter(|l| !l.trim().is_empty()).count();
+            if w == 60 {
+                assert!(used > 1, "wrapped at 60:\n{}", foot.join("\n"));
+            }
+            ed.allow_back = true;
+            let r = rows(&mut ed, w, 24);
+            assert!(r[r.len().saturating_sub(6)..].iter().any(|l| l.contains("s split")));
+        }
+    }
+
+    #[test]
+    fn a_short_terminal_falls_back_to_the_compact_footer_and_keeps_a_table_row() {
+        let mut ed = Editor::new(sample_plan());
+        let screen = draw(&mut ed, 60, 10);
+        assert!(screen.contains("? help") && screen.contains("q quit"), "{}", screen);
+        assert!(screen.contains("One"), "{}", screen);
+    }
+
+    #[test]
+    fn the_confirm_popup_wraps_whole_commands_on_a_narrow_terminal() {
+        let mut ed = Editor::new(sample_plan());
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        ed.handle_key(k('q'));
+        let r = rows(&mut ed, 40, 15);
+        for want in ["s save and continue", "d discard", "Esc keep editing"] {
+            assert!(r.iter().any(|l| l.contains(want)), "{:?} not whole:\n{}", want, r.join("\n"));
+        }
     }
 }

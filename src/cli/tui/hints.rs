@@ -25,12 +25,34 @@ pub fn hint_spans(pairs: &[(&str, &str)]) -> Vec<Span<'static>> {
     hint_spans_sep(pairs, "  ")
 }
 
+#[cfg(test)]
 pub fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
     Line::from(hint_spans(pairs))
 }
 
 pub fn hint_line_sep(pairs: &[(&str, &str)], sep: &str) -> Line<'static> {
     Line::from(hint_spans_sep(pairs, sep))
+}
+
+// Greedy line filling between commands: a command (key, space, description) is never split across lines.
+// A command wider than `width` stands alone on its line (the renderer clips it).
+pub fn wrap_hints(pairs: &[(&str, &str)], sep: &str, width: usize) -> Vec<Line<'static>> {
+    let sep_w = sep.chars().count();
+    let mut lines = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (i, (key, desc)) in pairs.iter().enumerate() {
+        let w = key.chars().count() + if desc.is_empty() { 0 } else { 1 + desc.chars().count() };
+        if i > start && used + sep_w + w > width {
+            lines.push(hint_line_sep(&pairs[start..i], sep));
+            (start, used) = (i, w);
+        } else {
+            used += if i > start { sep_w + w } else { w };
+        }
+    }
+    if start < pairs.len() {
+        lines.push(hint_line_sep(&pairs[start..], sep));
+    }
+    lines
 }
 
 // Test helper: the buffer cell where `needle` first starts in a row.
@@ -83,5 +105,71 @@ mod tests {
     fn separator_variant_keeps_spacing() {
         assert_eq!(plain(&hint_line_sep(&[("Tab", "next"), ("Space", "toggle")], "   ")), "Tab next   Space toggle");
         assert_eq!(plain(&hint_line_sep(&[("n", ""), ("q", "quit")], "    ")), "n    q quit");
+    }
+
+    const LIST: &[(&str, &str)] = &[("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing"), ("t", "tags"), ("g", "jump")];
+
+    fn cmd(p: &(&str, &str)) -> String {
+        if p.1.is_empty() { p.0.to_string() } else { format!("{} {}", p.0, p.1) }
+    }
+
+    #[test]
+    fn wrapping_keeps_whole_commands_in_order_within_the_width() {
+        let total = plain(&hint_line(LIST)).chars().count();
+        assert!(total > 50, "{}", total);
+        for width in [20usize, 30, 40, 80] {
+            let lines = wrap_hints(LIST, "  ", width);
+            assert!(!lines.is_empty());
+            let widest = LIST.iter().map(|p| cmd(p).chars().count()).max().unwrap();
+            let mut seen = Vec::new();
+            for l in &lines {
+                let text = plain(l);
+                assert!(text.chars().count() <= width.max(widest), "{:?} at {}", text, width);
+                for c in text.split("  ") {
+                    seen.push(c.to_string());
+                }
+            }
+            let want: Vec<String> = LIST.iter().map(cmd).collect();
+            assert_eq!(seen, want, "width {}", width);
+            if width >= total {
+                assert_eq!(lines.len(), 1);
+            } else {
+                assert!(lines.len() > 1, "width {}", width);
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_text_matches_hint_line_sep_for_its_subset() {
+        let lines = wrap_hints(LIST, "   ", 30);
+        let mut at = 0;
+        for l in &lines {
+            let n = plain(l).split("   ").count();
+            assert_eq!(plain(l), plain(&hint_line_sep(&LIST[at..at + n], "   ")));
+            at += n;
+        }
+        assert_eq!(at, LIST.len());
+    }
+
+    #[test]
+    fn an_oversize_command_sits_alone() {
+        let pairs = [("a", "b"), ("Enter", "a very long description indeed"), ("c", "d")];
+        let lines = wrap_hints(&pairs, "  ", 12);
+        let texts: Vec<String> = lines.iter().map(plain).collect();
+        assert_eq!(texts, vec!["a b", "Enter a very long description indeed", "c d"]);
+    }
+
+    #[test]
+    fn wrapped_lines_style_keys_only_and_handle_empty_descriptions() {
+        let pairs = [("Esc", ""), ("q", "quit"), ("?", "help")];
+        let lines = wrap_hints(&pairs, "  ", 9);
+        let texts: Vec<String> = lines.iter().map(plain).collect();
+        assert_eq!(texts, vec!["Esc", "q quit", "? help"]);
+        for l in &lines {
+            for s in &l.spans {
+                let key = ["Esc", "q", "?"].contains(&s.content.as_ref());
+                assert_eq!(is_key(s), key, "{:?}", s);
+            }
+        }
     }
 }

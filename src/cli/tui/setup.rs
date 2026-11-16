@@ -1,6 +1,6 @@
 // The Setup screen: where the book is, where the output goes, and the analysis options.
 use super::browser::{Browser, BrowserOutcome, Pick};
-use super::hints::hint_line_sep;
+use super::hints::wrap_hints;
 use super::input::Input;
 use audiobook_splitter_rust::plan::Settings;
 use audiobook_splitter_rust::{collect_inputs, user_path, AUDIO_EXTENSIONS};
@@ -187,7 +187,9 @@ impl Setup {
             } else {
                 let (text, col) = self.fields[row].view(field_w);
                 let note = self.feedback.get(row).cloned().unwrap_or_default();
-                lines.push(Line::from(vec![label, Span::raw(format!("{:<w$}", text, w = field_w)), Span::styled(format!("  {}", note), Style::new().fg(Color::Cyan))]));
+                // A path row with an entry turns green; the live note beside it says whether the path is usable.
+                let value_style = if row < 3 && !self.fields[row].value().trim().is_empty() { Style::new().fg(Color::Green) } else { Style::new() };
+                lines.push(Line::from(vec![label, Span::styled(format!("{:<w$}", text, w = field_w), value_style), Span::styled(format!("  {}", note), Style::new().fg(Color::Cyan))]));
                 if hot {
                     cursor = Some((inner.x + label_w + col as u16, inner.y + row as u16));
                 }
@@ -195,8 +197,7 @@ impl Setup {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(self.error.clone(), Style::new().fg(Color::Yellow)));
-        lines.push(hint_line_sep(&[("Tab", "next"), ("Enter", "browse (path rows)"), ("Space", "toggle")], "   "));
-        lines.push(hint_line_sep(&[("Ctrl-A", "analyze"), ("F1", "help"), ("Esc", "quit")], "   "));
+        lines.extend(wrap_hints(&[("Tab", "next"), ("Enter", "browse (path rows)"), ("Space", "toggle"), ("Ctrl-A", "analyze"), ("F1", "help"), ("Esc", "quit")], "   ", inner.width as usize));
         f.render_widget(Paragraph::new(lines), inner);
         match &mut self.browser {
             Some((_, browser)) => browser.render(f, area),
@@ -361,6 +362,19 @@ mod tests {
     }
 
     #[test]
+    fn a_path_row_with_an_entry_is_drawn_green() {
+        let mut s = filled("green"); // input and output set, EPUB left empty
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| s.render(f, f.area())).unwrap();
+        let buf = t.backend().buffer();
+        let (x, y0) = (25, 1); // the value column (border + 24-wide label), first row inside the border
+        assert_eq!(buf[(x, y0)].fg, Color::Green, "the audio path has an entry");
+        assert_eq!(buf[(x, y0 + 2)].fg, Color::Green, "the output folder has an entry");
+        assert_ne!(buf[(x, y0 + 1)].fg, Color::Green, "the empty EPUB row stays plain");
+        assert_ne!(buf[(x, y0 + 3)].fg, Color::Green, "number rows are never green");
+    }
+
+    #[test]
     fn it_draws_the_labels_feedback_and_hints_at_80x24_and_60x15() {
         let mut s = filled("draw");
         for (w, h) in [(80, 24), (60, 15), (30, 8)] {
@@ -373,6 +387,18 @@ mod tests {
                     assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_hints_wrap_between_commands_at_60_columns() {
+        let mut s = filled("hintwrap");
+        let mut t = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        t.draw(|f| s.render(f, f.area())).unwrap();
+        let buf = t.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect();
+        for want in ["Tab next", "Enter browse (path rows)", "Space toggle", "Ctrl-A analyze", "F1 help", "Esc quit"] {
+            assert!(rows.iter().any(|l| l.contains(want)), "{:?} not whole on one line:\n{}", want, rows.join("\n"));
         }
     }
 }
