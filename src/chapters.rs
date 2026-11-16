@@ -51,12 +51,25 @@ pub struct ChapterMatch {
     pub missing: Vec<usize>, // Chapters with no matching break.
 }
 
-// What to write for one input file: segment end times and optional file names.
+// What to write for one input file: segment end times.
 #[derive(Debug, PartialEq)]
 pub struct SplitJob {
     pub path: PathBuf,
     pub points: Vec<f64>,
-    pub names: Option<Vec<String>>,
+}
+
+// One output chapter: the stretches of input files it plays, in order.
+#[derive(Debug, PartialEq)]
+pub struct Segment {
+    pub name: String,
+    pub pieces: Vec<Piece>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Piece {
+    pub path: PathBuf,
+    pub start: f64,
+    pub end: f64,
 }
 
 // File starts plus every long-enough silence, in playback order.
@@ -131,39 +144,88 @@ pub fn pick_breaks(
     chapters: &[Chapter],
     threshold: f64,
 ) -> ChapterMatch {
-    let words: Vec<(Vec<String>, Vec<String>)> =
-        transcripts.iter().map(|(b, a)| (normalize(b), normalize(a))).collect();
-    let score = |ch: usize, c: usize| -> Option<f64> {
-        let (before, after) = &words[c];
-        let head = &chapters[ch].words[..edge_len(after.len()).min(chapters[ch].words.len())];
-        let after_score = bigram_score(after, head);
-        if after_score < threshold {
-            return None;
-        }
-        let before_score = ch.checked_sub(1).map_or(0.0, |prev| {
-            let w = &chapters[prev].words;
-            bigram_score(before, &w[w.len().saturating_sub(edge_len(before.len()))..])
-        });
-        Some(after_score + before_score)
-    };
+    let words = normalized(transcripts);
+    let score = |ch: usize, c: usize| match_score(chapters, ch, &words[c], threshold);
 
     let assigned = align(chapters.len(), cands.len(), &score);
     let mut breaks = Vec::new();
     let mut missing = Vec::new();
     for (ch, c) in assigned.into_iter().enumerate() {
         match c {
-            Some(c) => breaks.push(ChapterBreak {
-                file: cands[c].file,
-                at: cands[c].split_at(),
-                chapter: ch,
-                score: score(ch, c).unwrap_or(0.0),
-                before: transcripts[c].0.trim().to_string(),
-                after: transcripts[c].1.trim().to_string(),
-            }),
+            Some(c) => breaks.push(chapter_break(&cands[c], &transcripts[c], ch, score(ch, c).unwrap_or(0.0))),
             None => missing.push(ch),
         }
     }
     ChapterMatch { breaks, missing }
+}
+
+fn normalized(transcripts: &[(String, String)]) -> Vec<(Vec<String>, Vec<String>)> {
+    transcripts.iter().map(|(b, a)| (normalize(b), normalize(a))).collect()
+}
+
+// How well the words heard either side of a candidate fit the start of chapter `ch`;
+// None when the speech after it doesn't match the chapter's opening at `threshold`.
+fn match_score(chapters: &[Chapter], ch: usize, (before, after): &(Vec<String>, Vec<String>), threshold: f64) -> Option<f64> {
+    let head = &chapters[ch].words[..edge_len(after.len()).min(chapters[ch].words.len())];
+    let after_score = bigram_score(after, head);
+    if after_score < threshold {
+        return None;
+    }
+    let before_score = ch.checked_sub(1).map_or(0.0, |prev| {
+        let w = &chapters[prev].words;
+        bigram_score(before, &w[w.len().saturating_sub(edge_len(before.len()))..])
+    });
+    Some(after_score + before_score)
+}
+
+fn chapter_break(c: &Candidate, (before, after): &(String, String), chapter: usize, score: f64) -> ChapterBreak {
+    ChapterBreak { file: c.file, at: c.split_at(), chapter, score, before: before.trim().to_string(), after: after.trim().to_string() }
+}
+
+// A position in the book: (file index, seconds into that file).
+pub type Pos = (usize, f64);
+
+// Where to look again for a missing chapter: from the nearest found chapter before it
+// to the nearest found after it, or the start/end of the book.
+pub fn rescan_window(found: &[ChapterBreak], ch: usize, files: &[AudioFile]) -> (Pos, Pos) {
+    let before = found.iter().filter(|b| b.chapter < ch).max_by_key(|b| b.chapter);
+    let after = found.iter().filter(|b| b.chapter > ch).min_by_key(|b| b.chapter);
+    let end = files.len().saturating_sub(1);
+    (
+        before.map_or((0, 0.0), |b| (b.file, b.at)),
+        after.map_or((end, files.get(end).map_or(0.0, |f| f.duration)), |b| (b.file, b.at)),
+    )
+}
+
+// The window as (file, from, to) ranges, one per file it touches.
+pub fn window_ranges(files: &[AudioFile], from: Pos, to: Pos) -> Vec<(usize, f64, f64)> {
+    (from.0..=to.0)
+        .map(|f| (f, if f == from.0 { from.1 } else { 0.0 }, if f == to.0 { to.1 } else { files[f].duration }))
+        .filter(|&(_, start, end)| end - start > 0.01)
+        .collect()
+}
+
+// Candidates strictly inside the window; its ends are the breaks it runs between.
+pub fn window_candidates(files: &[AudioFile], from: Pos, to: Pos, min_silence: f64) -> Vec<Candidate> {
+    candidates(files, min_silence)
+        .into_iter()
+        .filter(|c| (c.file, c.split_at()) > (from.0, from.1 + EDGE_SECONDS) && (c.file, c.split_at()) < (to.0, to.1 - EDGE_SECONDS))
+        .collect()
+}
+
+// The candidate that best starts chapter `ch`, if any matches at `threshold`.
+pub fn rescan_chapter(
+    cands: &[Candidate],
+    transcripts: &[(String, String)],
+    chapters: &[Chapter],
+    ch: usize,
+    threshold: f64,
+) -> Option<ChapterBreak> {
+    let words = normalized(transcripts);
+    (0..cands.len())
+        .filter_map(|c| Some((c, match_score(chapters, ch, &words[c], threshold)?)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(c, score)| chapter_break(&cands[c], &transcripts[c], ch, score))
 }
 
 // Where a chapter starts, as edited in the GUI. `file` indexes the analyzed files.
@@ -200,9 +262,9 @@ pub fn silence_breaks(files: &[AudioFile], min_silence: f64) -> Vec<Break> {
         .collect()
 }
 
-// Turns chapter starts into split jobs, one per file. Each segment is named after its
-// chapter; a chapter running on into the next file gets "(part 2)" and so on.
-pub fn plan_from_breaks(files: &[AudioFile], breaks: &[Break]) -> Result<Vec<SplitJob>, String> {
+// Turns chapter starts into chapters, each named after its title. A chapter running on
+// into the next file takes in that file's opening too, so it comes out as one track.
+pub fn plan_from_breaks(files: &[AudioFile], breaks: &[Break]) -> Result<Vec<Segment>, String> {
     let mut breaks = breaks.to_vec();
     for b in &mut breaks {
         let duration = files.get(b.file).ok_or("A chapter break points at an unknown file.")?.duration;
@@ -218,37 +280,27 @@ pub fn plan_from_breaks(files: &[AudioFile], breaks: &[Break]) -> Result<Vec<Spl
         return Err(format!("'{}' and '{}' start at the same time.", w[0].title, w[1].title));
     }
 
-    let mut current: Option<String> = None; // Title of the chapter still playing.
-    let mut part = 1;
-    let mut jobs = Vec::new();
+    let mut segments = Vec::new();
     for (i, f) in files.iter().enumerate() {
-        let file_breaks: Vec<&Break> = breaks.iter().filter(|b| b.file == i).collect();
-        let mut points = Vec::new();
-        let mut names = Vec::new();
-        if !file_breaks.first().is_some_and(|b| b.at == 0.0) {
-            match &current {
-                Some(title) => {
-                    part += 1;
-                    names.push(format!("{} (part {})", title, part));
-                }
-                None => {
-                    names.push("Opening".to_string());
-                    current = Some("Opening".to_string());
-                }
-            }
-        }
-        for b in file_breaks {
+        let mut start = 0.0;
+        for b in breaks.iter().filter(|b| b.file == i) {
             if b.at > 0.0 {
-                points.push(b.at);
+                add_piece(&mut segments, f, start, b.at);
             }
-            names.push(b.title.trim().to_string());
-            current = Some(b.title.trim().to_string());
-            part = 1;
+            segments.push(Segment { name: b.title.trim().to_string(), pieces: Vec::new() });
+            start = b.at;
         }
-        points.push(f.duration);
-        jobs.push(SplitJob { path: f.path.clone(), points, names: Some(names) });
+        add_piece(&mut segments, f, start, f.duration);
     }
-    Ok(jobs)
+    Ok(segments)
+}
+
+// Adds audio to the chapter still playing, or to an "Opening" before the first chapter.
+fn add_piece(segments: &mut Vec<Segment>, f: &AudioFile, start: f64, end: f64) {
+    if segments.is_empty() {
+        segments.push(Segment { name: "Opening".into(), pieces: Vec::new() });
+    }
+    segments.last_mut().unwrap().pieces.push(Piece { path: f.path.clone(), start, end });
 }
 
 // Makes a chapter title safe to use as a file name.
@@ -336,16 +388,56 @@ mod tests {
         assert!(m.breaks[1].score > 1.0, "before + after should both count: {}", m.breaks[1].score);
     }
 
+    #[test]
+    fn rescan_window_spans_the_nearest_found_chapters() {
+        let files = [file("a.mp3", vec![], 100.0), file("b.mp3", vec![], 80.0)];
+        let found = [brk(0, 50.0, 8), brk(1, 20.0, 10), brk(0, 5.0, 2)];
+        assert_eq!(rescan_window(&found, 9, &files), ((0, 50.0), (1, 20.0)));
+        assert_eq!(rescan_window(&found, 1, &files), ((0, 0.0), (0, 5.0))); // Before the first.
+        assert_eq!(rescan_window(&found, 11, &files), ((1, 20.0), (1, 80.0))); // After the last.
+    }
+
+    #[test]
+    fn window_ranges_split_a_window_by_file() {
+        let files = [file("a.mp3", vec![], 100.0), file("b.mp3", vec![], 80.0), file("c.mp3", vec![], 50.0)];
+        assert_eq!(window_ranges(&files, (0, 60.0), (2, 10.0)), vec![(0, 60.0, 100.0), (1, 0.0, 80.0), (2, 0.0, 10.0)]);
+        assert_eq!(window_ranges(&files, (1, 5.0), (1, 30.0)), vec![(1, 5.0, 30.0)]);
+        assert_eq!(window_ranges(&files, (0, 60.0), (1, 0.0)), vec![(0, 60.0, 100.0)]); // Ends on a file start.
+    }
+
+    #[test]
+    fn window_candidates_stay_strictly_inside_the_window() {
+        let files = [
+            file("a.mp3", vec![sil(49.0, 51.0), sil(70.0, 71.0), sil(90.0, 90.2)], 100.0),
+            file("b.mp3", vec![sil(10.0, 11.0), sil(19.5, 20.5)], 80.0),
+        ];
+        // The silences at the window's own ends are the breaks it runs between; 90.0 is too short.
+        assert_eq!(
+            window_candidates(&files, (0, 50.0), (1, 20.0), 0.5),
+            vec![c(0, 70.0, 71.0), c(1, 0.0, 0.0), c(1, 10.0, 11.0)]
+        );
+    }
+
+    #[test]
+    fn rescan_chapter_picks_the_best_match_for_one_chapter() {
+        let chapters = [chapter("Chapter One", CH1), chapter("Chapter Two", CH2)];
+        let cands = [c(0, 40.0, 41.0), c(0, 90.0, 91.0)];
+        let t = transcripts(&[
+            ("as the fishing boats returned", "Old Tom stood at the end of the pier and counted every boat twice."),
+            ("The last one came in late and empty.", "Chapter two. Nobody in the village could remember a winter as cold as that one."),
+        ]);
+        let b = rescan_chapter(&cands, &t, &chapters, 1, 0.4).unwrap();
+        assert_eq!((b.file, b.at, b.chapter), (0, 90.5, 1));
+        assert!(b.after.starts_with("Chapter two"));
+        assert!(rescan_chapter(&cands[..1], &t[..1], &chapters, 1, 0.4).is_none());
+    }
+
     fn brk(file: usize, at: f64, chapter: usize) -> ChapterBreak {
         ChapterBreak { file, at, chapter, score: 1.0, before: String::new(), after: String::new() }
     }
 
     fn b(file: usize, at: f64, title: &str) -> Break {
         Break { file, at, title: title.to_string() }
-    }
-
-    fn names(v: &[&str]) -> Option<Vec<String>> {
-        Some(v.iter().map(|s| s.to_string()).collect())
     }
 
     #[test]
@@ -370,17 +462,22 @@ mod tests {
         );
     }
 
+    fn seg(name: &str, pieces: &[(&str, f64, f64)]) -> Segment {
+        let pieces = pieces.iter().map(|&(path, start, end)| Piece { path: path.into(), start, end }).collect();
+        Segment { name: name.to_string(), pieces }
+    }
+
     #[test]
-    fn plan_from_breaks_names_segments_and_continues_across_files() {
+    fn plan_from_breaks_joins_a_chapter_across_files() {
         let files = [file("a.mp3", vec![], 100.0), file("b.mp3", vec![], 80.0), file("c.mp3", vec![], 50.0)];
         // Unsorted on purpose; the Fall runs from mid a through b into c.
         let breaks = [b(0, 60.0, "The Fall"), b(0, 0.0, "Opening"), b(0, 5.0, "Chapter One")];
         assert_eq!(
             plan_from_breaks(&files, &breaks),
             Ok(vec![
-                SplitJob { path: "a.mp3".into(), points: vec![5.0, 60.0, 100.0], names: names(&["Opening", "Chapter One", "The Fall"]) },
-                SplitJob { path: "b.mp3".into(), points: vec![80.0], names: names(&["The Fall (part 2)"]) },
-                SplitJob { path: "c.mp3".into(), points: vec![50.0], names: names(&["The Fall (part 3)"]) },
+                seg("Opening", &[("a.mp3", 0.0, 5.0)]),
+                seg("Chapter One", &[("a.mp3", 5.0, 60.0)]),
+                seg("The Fall", &[("a.mp3", 60.0, 100.0), ("b.mp3", 0.0, 80.0), ("c.mp3", 0.0, 50.0)]),
             ])
         );
     }
@@ -391,10 +488,16 @@ mod tests {
         let breaks = [b(0, 0.0, "One"), b(1, 0.0, "Two"), b(1, 40.0, "Three")];
         assert_eq!(
             plan_from_breaks(&files, &breaks),
-            Ok(vec![
-                SplitJob { path: "a.mp3".into(), points: vec![100.0], names: names(&["One"]) },
-                SplitJob { path: "b.mp3".into(), points: vec![40.0, 80.0], names: names(&["Two", "Three"]) },
-            ])
+            Ok(vec![seg("One", &[("a.mp3", 0.0, 100.0)]), seg("Two", &[("b.mp3", 0.0, 40.0)]), seg("Three", &[("b.mp3", 40.0, 80.0)])])
+        );
+    }
+
+    #[test]
+    fn plan_from_breaks_opens_with_audio_before_the_first_break() {
+        let files = [file("a.mp3", vec![], 100.0), file("b.mp3", vec![], 80.0)];
+        assert_eq!(
+            plan_from_breaks(&files, &[b(1, 10.0, "One")]),
+            Ok(vec![seg("Opening", &[("a.mp3", 0.0, 100.0), ("b.mp3", 0.0, 10.0)]), seg("One", &[("b.mp3", 10.0, 80.0)])])
         );
     }
 
