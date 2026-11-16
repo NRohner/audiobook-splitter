@@ -1,8 +1,9 @@
 // The screen shown while a job runs: the current stage as a gauge, and the log below it.
+use super::hints::hint_spans_sep;
 use crate::cli::time::clock;
 use audiobook_splitter_rust::pipeline::Event;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, Paragraph};
 use ratatui::Frame;
 use std::time::Instant;
@@ -46,7 +47,10 @@ impl Progress {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::bordered().title(format!(" {}  (q quit, ? help) ", self.title));
+        let mut title = vec![Span::raw(format!(" {}  (", self.title))];
+        title.extend(hint_spans_sep(&[("q", "quit"), ("?", "help")], ", "));
+        title.push(Span::raw(") "));
+        let block = Block::bordered().title(Line::from(title));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let [gauge_row, log_area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);

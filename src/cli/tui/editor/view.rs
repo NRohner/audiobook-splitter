@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+use super::super::hints::{hint_line, hint_line_sep, hint_spans_sep, key_style};
 
 const HELP: &[(&str, &str)] = &[
     ("j/k, arrows, Pg, Home/End", "move the selection"),
@@ -102,14 +103,14 @@ impl Editor {
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let v = self.finish_verb();
         let keys = if area.width >= 100 {
-            format!("j/k move  r rename  [ ] move break  d remove  a add  n silence  m missing  t tags  g jump  p preview  u undo  s {}  q quit  ? help", v)
+            hint_line(&[("j/k", "move"), ("r", "rename"), ("[ ]", "move break"), ("d", "remove"), ("a", "add"), ("n", "silence"), ("m", "missing"), ("t", "tags"), ("g", "jump"), ("p", "preview"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")])
         } else if area.width >= 62 {
-            format!("r rename  [ ] move  d remove  a add  t tags  u undo  s {}  q quit  ? help", v)
+            hint_line(&[("r", "rename"), ("[ ]", "move"), ("d", "remove"), ("a", "add"), ("t", "tags"), ("u", "undo"), ("s", v), ("q", "quit"), ("?", "help")])
         } else {
-            format!("? help  s {}  q quit", v)
+            hint_line(&[("?", "help"), ("s", v), ("q", "quit")])
         };
         let status = Span::styled(self.status.clone(), Style::new().fg(Color::Yellow));
-        f.render_widget(Paragraph::new(vec![Line::raw(keys), Line::from(status)]), area);
+        f.render_widget(Paragraph::new(vec![keys, Line::from(status)]), area);
     }
 
     fn render_popup(&mut self, f: &mut Frame, area: Rect) {
@@ -147,10 +148,14 @@ impl Editor {
             }
             Mode::Tags(form) => form.render(f, area),
             Mode::ConfirmQuit => {
-                let text = if self.allow_back { "s split now    d discard    Esc keep editing" } else { "s save and continue    d discard    Esc keep editing" };
-                confirm(f, area, " Unsaved changes ", text)
+                let first = if self.allow_back { "split now" } else { "save and continue" };
+                confirm(f, area, " Unsaved changes ", hint_line_sep(&[("s", first), ("d", "discard"), ("Esc", "keep editing")], "    "))
             }
-            Mode::ConfirmBack => confirm(f, area, " Go back? ", "Edits will be lost.   y go back   Esc stay"),
+            Mode::ConfirmBack => {
+                let mut spans = vec![Span::raw("Edits will be lost.   ")];
+                spans.extend(hint_spans_sep(&[("y", "go back"), ("Esc", "stay")], "   "));
+                confirm(f, area, " Go back? ", Line::from(spans))
+            }
             Mode::Help => {
                 let rect = centered(area, 76, HELP.len() as u16 + 2);
                 let splits = self.allow_back;
@@ -158,7 +163,7 @@ impl Editor {
                     .iter()
                     .map(|(k, d)| {
                         let d = if splits && *k == "s / q, Ctrl-c" { "split / quit (asks if unsaved)" } else { d };
-                        Line::from(vec![Span::styled(format!("{:<26}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(d)])
+                        Line::from(vec![Span::styled(format!("{:<26}", k), key_style()), Span::raw(d)])
                     })
                     .collect();
                 f.render_widget(Clear, rect);
@@ -168,7 +173,7 @@ impl Editor {
     }
 }
 
-fn confirm(f: &mut Frame, area: Rect, title: &str, text: &str) {
+fn confirm(f: &mut Frame, area: Rect, title: &str, text: Line) {
     let rect = centered(area, 72, 3);
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), rect);
@@ -179,6 +184,7 @@ mod tests {
     use super::super::*;
     use crate::cli::edit::ops::sample_plan;
     use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
     use ratatui::Terminal;
 
     fn draw(ed: &mut Editor, w: u16, h: u16) -> String {
@@ -342,5 +348,28 @@ mod tests {
         assert!(screen.contains("Extra 40") && !screen.contains("Extra 1 "), "{}", screen);
         ed.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert!(draw(&mut ed, 80, 24).contains("One"));
+    }
+
+    fn assert_key_style(ed: &mut Editor, w: u16, h: u16, key_and_desc: &str, key_len: u16) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ed.render(f)).unwrap();
+        let buf = t.backend().buffer();
+        let (x, y) = crate::cli::tui::hints::find_text(buf, key_and_desc).unwrap_or_else(|| panic!("no {:?}", key_and_desc));
+        let key = buf[(x, y)].style();
+        assert_eq!(key.fg, Some(Color::Cyan), "{}", key_and_desc);
+        assert!(key.add_modifier.contains(Modifier::BOLD), "{}", key_and_desc);
+        let desc = buf[(x + key_len + 1, y)].style();
+        assert_ne!(desc.fg, Some(Color::Cyan), "{}", key_and_desc);
+        assert!(!desc.add_modifier.contains(Modifier::BOLD), "{}", key_and_desc);
+    }
+
+    #[test]
+    fn the_footer_and_confirm_popup_keys_are_bold_cyan() {
+        let mut ed = Editor::new(sample_plan());
+        assert_key_style(&mut ed, 80, 24, "q quit", 1);
+        ed.handle_key(k('j'));
+        ed.handle_key(k(']'));
+        ed.handle_key(k('q'));
+        assert_key_style(&mut ed, 80, 24, "Esc keep editing", 3);
     }
 }

@@ -1,6 +1,5 @@
 // A help popup for the screens that have no key table of their own.
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
@@ -30,7 +29,7 @@ pub fn render_help(f: &mut Frame, area: Rect, title: &str, keys: &[(&str, &str)]
     let rect = super::editor::centered(area, 70, keys.len() as u16 + 2);
     let lines: Vec<Line> = keys
         .iter()
-        .map(|(k, d)| Line::from(vec![Span::styled(format!("{:<26}", k), Style::new().add_modifier(Modifier::BOLD)), Span::raw(*d)]))
+        .map(|(k, d)| Line::from(vec![Span::styled(format!("{:<26}", k), super::hints::key_style()), Span::raw(*d)]))
         .collect();
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(Block::bordered().title(format!(" {} (any key closes) ", title))), rect);

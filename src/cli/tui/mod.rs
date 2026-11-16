@@ -2,6 +2,7 @@
 pub mod browser;
 pub mod editor;
 pub mod help;
+pub mod hints;
 pub mod input;
 pub mod jobs;
 pub mod progress;
@@ -20,7 +21,7 @@ use browser::{Browser, BrowserOutcome, Pick};
 use jobs::{Job, Msg};
 use progress::Progress;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use setup::{AnalyzeRequest, Setup, SetupOutcome};
@@ -297,7 +298,10 @@ impl App {
         if self.confirm_quit {
             let rect = editor::centered(area, 60, 3);
             f.render_widget(Clear, rect);
-            f.render_widget(Paragraph::new("Job running. Quit anyway?  y quit  other key: stay").block(Block::bordered().title(" Quit ")), rect);
+            let mut spans = vec![Span::raw("Job running. Quit anyway?  ")];
+            spans.extend(hints::hint_spans(&[("y", "quit")]));
+            spans.push(Span::raw("  other key: stay"));
+            f.render_widget(Paragraph::new(Line::from(spans)).block(Block::bordered().title(" Quit ")), rect);
         }
         if self.help {
             match &self.screen {
@@ -329,7 +333,17 @@ fn render_done(f: &mut Frame, area: Rect, info: &DoneInfo) {
         (None, None) => {}
     }
     lines.push(Line::raw(""));
-    lines.push(Line::raw("n  another book    q or Enter  quit    ? help"));
+    let key = hints::key_style();
+    lines.push(Line::from(vec![
+        Span::styled("n", key),
+        Span::raw("  another book    "),
+        Span::styled("q", key),
+        Span::raw(" or "),
+        Span::styled("Enter", key),
+        Span::raw("  quit    "),
+        Span::styled("?", key),
+        Span::raw(" help"),
+    ]));
     if info.failed > 0 || info.error.is_some() {
         lines.push(Line::raw(""));
         lines.extend(info.log.iter().map(|l| Line::raw(l.as_str())));

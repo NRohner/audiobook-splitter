@@ -1,4 +1,5 @@
 // A file browser popup: pick a file or folder with the keyboard, or type a path.
+use super::hints::hint_line;
 use super::input::Input;
 use audiobook_splitter_rust::user_path;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -303,9 +304,9 @@ impl Browser {
         }
 
         let hint = match self.pick {
-            Pick::Folder => "Enter open  Space choose this folder  Backspace up  / filter  . hidden  Tab type path  Esc cancel",
-            Pick::File(_) => "Enter open or pick  Backspace up  / filter  . hidden  Tab type path  Esc cancel",
-            Pick::FileOrFolder(_) => "Enter open or pick  Space choose this folder  Backspace up  / filter  . hidden  Tab type path  Esc cancel",
+            Pick::Folder => hint_line(&[("Enter", "open"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
+            Pick::File(_) => hint_line(&[("Enter", "open or pick"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
+            Pick::FileOrFolder(_) => hint_line(&[("Enter", "open or pick"), ("Space", "choose this folder"), ("Backspace", "up"), ("/", "filter"), (".", "hidden"), ("Tab", "type path"), ("Esc", "cancel")]),
         };
         let line = if self.error.is_empty() { Paragraph::new(hint) } else { Paragraph::new(self.error.clone()).style(Style::new().fg(Color::Yellow)) };
         f.render_widget(line, hint_row);
@@ -543,5 +544,21 @@ mod tests {
                 assert!(!screen.contains("y.txt"), "files that don't match the filter are not listed");
             }
         }
+    }
+
+    #[test]
+    fn the_hint_keys_are_bold_cyan_and_the_descriptions_are_plain() {
+        let dir = tree("hintstyle");
+        let mut b = Browser::new("Pick", dir.to_str().unwrap(), MP3);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| b.render(f, f.area())).unwrap();
+        let buf = t.backend().buffer();
+        let (x, y) = super::super::hints::find_text(buf, "Enter open").expect("the hint row");
+        let key = buf[(x, y)].style();
+        assert_eq!(key.fg, Some(Color::Cyan));
+        assert!(key.add_modifier.contains(Modifier::BOLD));
+        let desc = buf[(x + 6, y)].style();
+        assert_ne!(desc.fg, Some(Color::Cyan));
+        assert!(!desc.add_modifier.contains(Modifier::BOLD));
     }
 }

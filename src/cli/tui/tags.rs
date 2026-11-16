@@ -1,5 +1,6 @@
 // The tags, file naming and cover art form, opened from the editor with `t`.
 use super::browser::{Browser, BrowserOutcome, Pick};
+use super::hints::{hint_spans, hint_spans_sep};
 use super::input::Input;
 use crate::cli::edit::ops;
 use audiobook_splitter_rust::cover::find_embedded;
@@ -150,7 +151,11 @@ impl TagsForm {
         let rows = self.rows() as u16;
         let rect = super::editor::centered(area, 76, rows + 7);
         f.render_widget(Clear, rect);
-        let block = Block::bordered().title(" Tags, file naming and cover art (Tab next, Enter save, Esc cancel) ");
+        let mut title = vec![Span::raw(" Tags, file naming and cover art (")];
+        title.extend(hint_spans_sep(&[("Tab", "next"), ("Enter", "save"), ("Esc", "cancel")], ", "));
+        title.push(Span::raw(") "));
+        let title = Line::from(title);
+        let block = Block::bordered().title(title);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let label_w = 14;
@@ -184,7 +189,9 @@ impl TagsForm {
             }
         }
         if self.focus == COVER_ROW || self.focus == IMAGE_ROW {
-            lines.push(Line::raw(format!("{:<w$}Ctrl-B browses for the image", "", w = label_w)));
+            let mut spans = vec![Span::raw(format!("{:<w$}", "", w = label_w))];
+            spans.extend(hint_spans(&[("Ctrl-B", "browses for the image")]));
+            lines.push(Line::from(spans));
         } else {
             lines.push(Line::raw(""));
         }

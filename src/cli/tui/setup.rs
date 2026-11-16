@@ -1,5 +1,6 @@
 // The Setup screen: where the book is, where the output goes, and the analysis options.
 use super::browser::{Browser, BrowserOutcome, Pick};
+use super::hints::hint_line_sep;
 use super::input::Input;
 use audiobook_splitter_rust::plan::Settings;
 use audiobook_splitter_rust::{collect_inputs, user_path, AUDIO_EXTENSIONS};
@@ -194,8 +195,8 @@ impl Setup {
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(self.error.clone(), Style::new().fg(Color::Yellow)));
-        lines.push(Line::raw("Tab next   Enter browse (path rows)   Space toggle"));
-        lines.push(Line::raw("Ctrl-A analyze   F1 help   Esc quit"));
+        lines.push(hint_line_sep(&[("Tab", "next"), ("Enter", "browse (path rows)"), ("Space", "toggle")], "   "));
+        lines.push(hint_line_sep(&[("Ctrl-A", "analyze"), ("F1", "help"), ("Esc", "quit")], "   "));
         f.render_widget(Paragraph::new(lines), inner);
         match &mut self.browser {
             Some((_, browser)) => browser.render(f, area),
