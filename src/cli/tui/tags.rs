@@ -1,4 +1,5 @@
 // The tags, file naming and cover art form, opened from the editor with `t`.
+use super::browser::{Browser, BrowserOutcome, Pick};
 use super::input::Input;
 use crate::cli::edit::ops;
 use audiobook_splitter_rust::cover::find_embedded;
@@ -36,6 +37,7 @@ pub struct TagsForm {
     image: Input,
     embedded: Option<String>, // the file `Keep` would take the cover from
     focus: usize,             // 0..=5 the text fields, COVER_ROW, IMAGE_ROW (only for an image)
+    browser: Option<Browser>,
     pub error: String,
 }
 
@@ -53,6 +55,7 @@ impl TagsForm {
             image: Input::new(&image),
             embedded: find_embedded(&plan.files).map(|(i, _)| file_name(&plan.files[i].path)),
             focus: 0,
+            browser: None,
             error: String::new(),
         }
     }
@@ -68,6 +71,18 @@ impl TagsForm {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FormOutcome {
+        if let Some(mut browser) = self.browser.take() {
+            match browser.handle_key(key) {
+                BrowserOutcome::Continue => self.browser = Some(browser),
+                BrowserOutcome::Cancel => {}
+                BrowserOutcome::Chosen(path) => {
+                    self.image = Input::new(&path.display().to_string());
+                    self.cover = CoverChoice::Image;
+                    self.focus = IMAGE_ROW;
+                }
+            }
+            return FormOutcome::Continue;
+        }
         self.error.clear();
         let rows = self.rows();
         match key.code {
@@ -75,6 +90,9 @@ impl TagsForm {
             KeyCode::Enter => return FormOutcome::Save,
             KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % rows,
             KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + rows - 1) % rows,
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) && (self.focus == COVER_ROW || self.focus == IMAGE_ROW) => {
+                self.browser = Some(Browser::new("Choose the cover image", &self.image.value(), Pick::File(&["jpg", "jpeg", "png"])));
+            }
             _ if self.focus == COVER_ROW => match key.code {
                 KeyCode::Left => self.cycle_cover(-1),
                 KeyCode::Right | KeyCode::Char(' ') => self.cycle_cover(1),
@@ -117,9 +135,9 @@ impl TagsForm {
         Ok(())
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let rows = self.rows() as u16;
-        let rect = super::editor::centered(area, 76, rows + 6);
+        let rect = super::editor::centered(area, 76, rows + 7);
         f.render_widget(Clear, rect);
         let block = Block::bordered().title(" Tags, file naming and cover art (Tab next, Enter save, Esc cancel) ");
         let inner = block.inner(rect);
@@ -154,11 +172,18 @@ impl TagsForm {
                 cursor = Some((inner.x + (label_w + col) as u16, inner.y + lines.len() as u16 - 1));
             }
         }
-        lines.push(Line::raw(""));
+        if self.focus == COVER_ROW || self.focus == IMAGE_ROW {
+            lines.push(Line::raw(format!("{:<w$}Ctrl-B browses for the image", "", w = label_w)));
+        } else {
+            lines.push(Line::raw(""));
+        }
         lines.push(Line::styled(self.error.clone(), Style::new().fg(ratatui::style::Color::Yellow)));
         f.render_widget(Paragraph::new(lines), inner);
         if let Some(pos) = cursor {
             f.set_cursor_position(pos);
+        }
+        if let Some(browser) = &mut self.browser {
+            browser.render(f, area);
         }
     }
 }
@@ -291,37 +316,73 @@ mod tests {
         form.image = Input::new(text);
     }
 
-    #[test]
-    fn it_draws_its_labels_and_the_embedded_cover_note() {
-        let form = TagsForm::from_plan(&plan());
-        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn draw(form: &mut TagsForm, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| form.render(f, f.area())).unwrap();
         let buf = t.backend().buffer();
-        let screen: String = (0..buf.area.height)
-            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
+        (0..buf.area.height).map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn it_draws_its_labels_and_the_embedded_cover_note() {
+        let mut form = TagsForm::from_plan(&plan());
+        let screen = draw(&mut form, 80, 24);
         for want in ["Album", "Moby Dick", "Album artist", "Genre", "Year", "File naming", "Cover art", "none found"] {
             assert!(screen.contains(want), "missing {:?} in\n{}", want, screen);
         }
-        let mut small = Terminal::new(TestBackend::new(60, 15)).unwrap();
-        small.draw(|f| form.render(f, f.area())).unwrap();
+        draw(&mut form, 60, 15);
+    }
+
+    #[test]
+    fn ctrl_b_on_the_cover_rows_opens_the_browser_and_a_choice_fills_the_image() {
+        let mut p = plan();
+        let image = png("chosen.png");
+        let mut form = TagsForm::from_plan(&p);
+        form.handle_key(ctrl('b'));
+        assert!(form.browser.is_none(), "Ctrl-B only works on the cover rows");
+        form.focus = COVER_ROW;
+        form.handle_key(ctrl('b'));
+        assert!(form.browser.is_some());
+        form.handle_key(k(KeyCode::Esc));
+        assert!(form.browser.is_none() && form.cover == CoverChoice::Keep, "Esc closes only the browser");
+        form.image = Input::new(image.to_str().unwrap());
+        form.handle_key(ctrl('b'));
+        assert_eq!(form.browser.as_ref().unwrap().selected_name().as_deref(), Some("chosen.png"));
+        assert!(matches!(form.handle_key(k(KeyCode::Enter)), FormOutcome::Continue), "Enter in the browser picks; it does not save the form");
+        assert!(form.browser.is_none());
+        assert_eq!((form.cover, form.focus), (CoverChoice::Image, IMAGE_ROW));
+        form.apply(&mut p).unwrap();
+        assert_eq!(p.metadata.cover, Cover::File(image));
+    }
+
+    #[test]
+    fn the_cover_browser_lists_only_jpeg_and_png_files_and_draws_over_the_form() {
+        let image = png("only.png");
+        let dir = image.parent().unwrap().to_path_buf();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let mut form = TagsForm::from_plan(&plan());
+        form.focus = IMAGE_ROW;
+        form.cover = CoverChoice::Image;
+        form.image = Input::new(dir.to_str().unwrap());
+        form.handle_key(ctrl('b'));
+        let screen = draw(&mut form, 80, 24);
+        assert!(screen.contains("only.png") && !screen.contains("notes.txt"), "{}", screen);
+        draw(&mut form, 60, 15);
     }
 
     #[test]
     fn a_refused_save_shows_its_error_at_every_size() {
         for cover in [CoverChoice::Keep, CoverChoice::Image] {
-            for (w, h) in [(80, 24), (60, 15)] {
+            for (w, h, focus) in [(80, 24, 0), (60, 15, 0), (80, 24, COVER_ROW), (60, 15, COVER_ROW)] {
                 let mut form = TagsForm::from_plan(&plan());
                 form.cover = cover;
+                form.focus = focus; // the cover rows also show the Ctrl-B hint
                 form.error = "Enter a track naming convention, such as {n} - {title}.".into();
-                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-                t.draw(|f| form.render(f, f.area())).unwrap();
-                let buf = t.backend().buffer();
-                let screen: String = (0..buf.area.height)
-                    .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let screen = draw(&mut form, w, h);
                 assert!(screen.contains("Enter a track naming convention"), "{:?} {}x{} lost the error in\n{}", cover, w, h, screen);
             }
         }

@@ -104,8 +104,8 @@ impl Editor {
         f.render_widget(Paragraph::new(vec![Line::raw(keys), Line::from(status)]), area);
     }
 
-    fn render_popup(&self, f: &mut Frame, area: Rect) {
-        match &self.mode {
+    fn render_popup(&mut self, f: &mut Frame, area: Rect) {
+        match &mut self.mode {
             Mode::Normal => {}
             Mode::Prompt { kind, input } => {
                 let title = match kind {
